@@ -186,10 +186,10 @@ export default function UpgradeScreen() {
             <Text style={[styles.periodText, period === "annual" && styles.periodTextActive]}>
               Annual
             </Text>
-            <View style={styles.saveBadge}>
-              <Text style={styles.saveText}>SAVE 20%</Text>
-            </View>
           </PressScale>
+          <View style={styles.saveBadge} pointerEvents="none">
+            <Text style={styles.saveText}>SAVE 20%</Text>
+          </View>
         </View>
 
         {/* Plan cards */}
@@ -340,6 +340,7 @@ const makeStyles = (c: any, mode: "light" | "dark") =>
       borderRadius: radii.pill,
       padding: 4,
       marginBottom: space.lg,
+      position: "relative",
     },
     periodBtn: {
       flex: 1,
@@ -353,8 +354,16 @@ const makeStyles = (c: any, mode: "light" | "dark") =>
     periodBtnActive: { backgroundColor: c.primary },
     periodText: { fontFamily: fonts.bodySemi, fontSize: 13, color: c.textSecondary },
     periodTextActive: { color: "#fff" },
-    saveBadge: { backgroundColor: c.successBg, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
-    saveText: { fontFamily: fonts.monoBold, fontSize: 9, color: c.success, letterSpacing: 1 },
+    saveBadge: {
+      position: "absolute",
+      top: -8,
+      right: 12,
+      backgroundColor: c.success,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+      borderRadius: 4,
+    },
+    saveText: { fontFamily: fonts.monoBold, fontSize: 9, color: "#fff", letterSpacing: 1 },
 
     planCard: {
       backgroundColor: c.surface,

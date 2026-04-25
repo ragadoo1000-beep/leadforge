@@ -86,6 +86,30 @@ Per `/app/design_guidelines.json` — "Tactical Minimalism" archetype:
 
 All four signals render in a single **VERIFICATION** panel on the Lead Detail screen with Run Check + Mark Legit buttons.
 
+## Iteration 3 — Razorpay Subscriptions + Theme Toggle + Animations
+
+### Razorpay Subscriptions
+- 3 tiers managed via `PLAN_CATALOG` constant in `server.py` (single source of truth):
+  - **Minimum** ₹299/mo or ₹2,870/yr — 25 leads/day, 12 messages/day
+  - **Professional** ₹399/mo or ₹3,830/yr — 100 leads/day, 50 messages/day  ⭐ Most Popular
+  - **Expert** ₹499/mo or ₹4,790/yr — Unlimited (1000+ daily caps)
+- 7-day card-upfront free trial. Trial is implemented via Razorpay's `start_at` parameter (first charge happens on day 8).
+- Endpoints: `/billing/plans`, `/billing/me`, `/billing/create-subscription`, `/billing/verify` (HMAC-checked), `/billing/cancel`, `/billing/webhook` (signature-verified)
+- **Demo mode** automatically activates when `RAZORPAY_KEY_ID` is empty in `.env` — `create-subscription` instantly grants trial, no real charge. User can swap real keys later without code changes.
+- Webhook syncs subscription state (`activated`, `charged`, `cancelled`, `halted`, etc.) to user document.
+- Dynamic daily caps per `get_user_limits(user)` — old binary `is_premium` still works as fallback.
+
+### UI Overhaul (Dribbble-inspired)
+- New **light theme** with white surfaces, blue accent (`#2D52F5`), soft shadows, larger rounded corners (`radii.lg = 16`, `radii.xl = 20`, `radii.pill = 999`).
+- **Theme toggle** in Profile (testID: `theme-toggle`) — flips entire app via `ThemeContext`, persisted in AsyncStorage (`leadforge_theme`).
+- New `/upgrade` screen with: gradient title, period toggle (Monthly/Annual with SAVE 20% badge), 3 plan cards with selected-radio + MOST POPULAR badge, payment-method chips (UPI/VISA/MASTERCARD/RUPAY/NETBANKING), sticky CTA.
+- All existing screens still work (use static dark `colors` export — backward-compat).
+
+### Micro-Animations (`react-native-reanimated`)
+- New `<PressScale>` component: spring scale 0.96 + opacity 0.85 on press, 60fps.
+- `FadeInDown` + `FadeIn` staggered on the upgrade screen (header, banner, plan cards, CTA).
+- Profile theme toggle uses native Switch animation.
+
 ## Future / Backlog
 - Real Stripe integration for premium upgrade
 - Reddit OAuth credentials (when user provides them) for un-blocked access
