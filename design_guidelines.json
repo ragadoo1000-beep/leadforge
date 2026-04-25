@@ -1,0 +1,124 @@
+{
+  "project_name": "LeadForge AI",
+  "platform": "React Native (Expo SDK 54)",
+  "theme": "dark",
+  "archetype": "Archetype 2: The Performance Pro (Tactical Minimalism)",
+  "design_philosophy": "High-visibility command-center aesthetic. Replaces soft shadows with 1px solid strokes and high-saturation accent blocks. Function-first, no clutter.",
+  "colors": {
+    "background": "#0A0A0A",
+    "surface": "#141414",
+    "surface_elevated": "#1A1A1A",
+    "border": "#262626",
+    "border_focus": "#FF5C00",
+    "primary": "#FF5C00",
+    "primary_hover": "#E05200",
+    "text_primary": "#FFFFFF",
+    "text_secondary": "#A1A1AA",
+    "text_tertiary": "#71717A",
+    "success": "#10B981",
+    "success_bg": "rgba(16, 185, 129, 0.15)",
+    "warning": "#F59E0B",
+    "warning_bg": "rgba(245, 158, 11, 0.15)",
+    "error": "#EF4444",
+    "error_bg": "rgba(239, 68, 68, 0.15)",
+    "info": "#3B82F6",
+    "info_bg": "rgba(59, 130, 246, 0.15)"
+  },
+  "typography": {
+    "font_families": {
+      "heading": "Sora",
+      "body": "Geist",
+      "mono": "Geist Mono"
+    },
+    "scales": {
+      "h1": "text-4xl tracking-tighter leading-tight font-bold",
+      "h2": "text-3xl tracking-tight leading-tight font-semibold",
+      "h3": "text-2xl tracking-tight leading-snug font-semibold",
+      "h4": "text-xl tracking-tight leading-snug font-medium",
+      "body": "text-base leading-relaxed text-[#A1A1AA]",
+      "small": "text-sm leading-normal text-[#71717A]",
+      "overline": "text-xs uppercase tracking-[0.2em] font-medium text-[#71717A]",
+      "score": "text-2xl font-mono font-bold tracking-tight"
+    }
+  },
+  "layout": {
+    "container_padding": "px-4 md:px-6",
+    "card_radius": "rounded-lg",
+    "card_border": "border border-[#262626]",
+    "card_padding": "p-5",
+    "gap_small": "gap-2",
+    "gap_medium": "gap-4",
+    "gap_large": "gap-6",
+    "shadows": "none"
+  },
+  "components": {
+    "lead_card": {
+      "structure": "Flat #141414 background, 1px #262626 border, 8px radius. No shadows.",
+      "header": "Left: Subreddit tag (overline). Right: AI Score Badge (Mono font, color-coded based on 0-100 score).",
+      "body": "Lead Title (H4, Sora, White). AI Summary (Body, Geist, text-secondary).",
+      "footer": "Intent Pill (High/Med/Low) + Timestamp. Full card is pressable with subtle opacity reduction on active.",
+      "test_ids": ["lead-card-container", "lead-score-badge", "lead-intent-pill", "lead-title"]
+    },
+    "intent_pills": {
+      "high": "Text: #10B981, BG: #10B981 at 15% opacity, Border: 1px solid rgba(16, 185, 129, 0.3)",
+      "medium": "Text: #F59E0B, BG: #F59E0B at 15% opacity, Border: 1px solid rgba(245, 158, 11, 0.3)",
+      "low": "Text: #71717A, BG: #262626, Border: 1px solid #3F3F46"
+    },
+    "score_badge": {
+      "style": "Geist Mono. Numeric score + '/100'. Use pure text colors (Success/Warning) over #1A1A1A background with 4px radius."
+    },
+    "bottom_navigation": {
+      "style": "Solid #0A0A0A background with 1px top border (#262626). Active icon gets primary color (#FF5C00). Inactive gets text-tertiary (#71717A).",
+      "tabs": ["Feed", "CRM", "Invoice", "Profile"]
+    },
+    "crm_kanban_tabs": {
+      "style": "Horizontal scrollable list of segmented buttons (New, Saved, Contacted, Replied, Closed). Active state has a bottom border or filled surface background.",
+      "test_id": "crm-tab-button"
+    },
+    "buttons": {
+      "primary": "Solid background #FF5C00, text #FFFFFF, font-semibold, rounded-md, py-3 px-6.",
+      "secondary": "Transparent background, border border-[#262626], text #FFFFFF, font-medium, py-3 px-6.",
+      "test_id_pattern": "*-btn"
+    },
+    "inputs": {
+      "style": "Background #141414, border #262626, text #FFFFFF, rounded-md, px-4 py-3. Focus state: border #FF5C00.",
+      "test_id_pattern": "*-input"
+    }
+  },
+  "media": {
+    "image_urls": [
+      {
+        "url": "https://images.unsplash.com/photo-1770745560263-a8fc696de90b?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzV8MHwxfHNlYXJjaHwyfHxkYXJrJTIwYWJzdHJhY3QlMjB0ZXh0dXJlfGVufDB8fHx8MTc3NzA2NDIxNXww&ixlib=rb-4.1.0&q=85",
+        "category": "background",
+        "description": "Abstract black and white flowing fabric texture - use as the background for the 'Upgrade to Premium' screen behind an overlay gradient (e.g., bg-black/80)."
+      },
+      {
+        "url": "https://images.pexels.com/photos/7505924/pexels-photo-7505924.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "category": "texture",
+        "description": "Dark abstract image with reflective surfaces - use as a subtle texture over the Profile header or Leaderboard top section (opacity 10-20%)."
+      }
+    ]
+  },
+  "motion_and_interactions": {
+    "press_states": "All pressable elements (buttons, cards) MUST use React Native's Pressable with opacity reduction (e.g. 0.7) on pressIn.",
+    "screen_transitions": "Use standard React Navigation slide-from-right or modal slide-from-bottom for Lead Details.",
+    "haptics": "Trigger light haptic feedback (expo-haptics) on tab changes, lead saves, and copying AI messages."
+  },
+  "testing_attributes": {
+    "rule": "Every interactive element MUST include a testID property.",
+    "examples": [
+      "testID='login-submit-button'",
+      "testID='generate-message-btn'",
+      "testID='crm-tab-contacted'",
+      "testID='copy-to-clipboard-btn'"
+    ]
+  },
+  "instructions_to_main_agent": [
+    "Strictly follow the 'Tactical Minimalism' dark theme. Do NOT use soft shadows (elevation). Rely strictly on 1px borders (#262626) to define depth.",
+    "Use NativeWind or StyleSheet for styling matching the provided Tailwind-style hex colors and spacing.",
+    "Use Sora for all headings and card titles. Use Geist for body text. Use Geist Mono exclusively for AI scores and XP points. Do NOT use Inter or Roboto.",
+    "Implement the 'Upgrade to Premium' screen using the provided Unsplash abstract texture as a background image with a heavy black gradient overlay.",
+    "All buttons, inputs, tabs, and list items MUST have testID attributes in the React Native components.",
+    "Do not use generic blue/purple AI gradients. Stick to the Forge Orange (#FF5C00) as the primary accent to maintain the energetic, functional aesthetic."
+  ]
+}
