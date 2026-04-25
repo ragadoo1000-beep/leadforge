@@ -490,7 +490,8 @@ async def ai_score_lead(title: str, body: str) -> dict:
     """Score a lead using Gemini Flash. Returns {score, intent, summary, spam_score, spam_flags}."""
     system = (
         "You are a lead qualification AI for freelancers. Analyze Reddit posts where "
-        "people might be hiring. Return ONLY valid JSON, no markdown, no extra text."
+        "people might be hiring. Return ONLY valid JSON, no markdown, no extra text. "
+        "Never produce content that promotes spam, guarantees outcomes, or encourages mass outreach."
     )
     prompt = f"""Analyze this Reddit post and return JSON with these exact keys:
 - "score": integer 0-100 (lead quality; high if clear requirement, budget mentioned, urgency)
@@ -838,7 +839,17 @@ async def generate_message(payload: GenerateMessageIn, user: dict = Depends(get_
     portfolio = ", ".join(user.get("portfolio_links", [])) or "Available on request"
     name = user.get("name", "")
 
-    system = "You are an expert outreach copywriter for freelancers. Write authentic, non-spammy messages."
+    system = (
+        "You are an expert outreach copywriter for freelancers. Write authentic, "
+        "non-spammy messages that one specific person would send to one specific potential client. "
+        "STRICT CONSTRAINTS: "
+        "(1) NEVER produce templated, generic, or copy-pasteable boilerplate. "
+        "(2) NEVER guarantee results, deliverables, or client acquisition. "
+        "(3) NEVER use pressure tactics, urgency manipulation, or 'limited offer' framing. "
+        "(4) NEVER encourage mass outreach or bulk messaging. "
+        "(5) Always reference something SPECIFIC from the client's actual post — proving the message was written for them, not blasted. "
+        "(6) Keep messages short, human, and respectful of the recipient's time."
+    )
     prompt = f"""Generate two outreach messages for this freelance opportunity.
 
 FREELANCER PROFILE:
@@ -857,10 +868,12 @@ Return ONLY valid JSON like:
 {{"reddit_dm": "...", "email": "..."}}
 
 Requirements:
-- Reddit DM: 4-6 lines, casual, reference their specific need, mention 1 relevant skill, end with a soft CTA
+- Reddit DM: 4-6 lines, casual, reference their SPECIFIC need (mention an actual detail from their post), mention 1 relevant skill, end with a soft non-pressuring CTA (e.g. "happy to chat if it sounds useful")
 - Email: 6-8 lines with subject line at start (Subject: ...), more formal but {tone.lower()} in tone
-- Do NOT use generic phrases like "I hope this finds you well"
-- Mention something specific from their post"""
+- Do NOT use generic phrases like "I hope this finds you well", "I'd love to learn more", "I'm a hard worker"
+- Do NOT make guarantees (no "I'll definitely deliver", "I guarantee results", "you'll be 100% satisfied")
+- Do NOT use urgency tactics ("limited time", "act now")
+- Do NOT mention price unless the client explicitly asked"""
     try:
         chat = LlmChat(
             api_key=EMERGENT_LLM_KEY,
@@ -1042,6 +1055,97 @@ async def daily_check_in(user: dict = Depends(get_current_user)):
 @api_router.get("/")
 async def root():
     return {"status": "ok", "service": "LeadForge AI"}
+
+
+# ============== Compliance / Policy / Transparency ==============
+
+POLICY_DOC = {
+    "version": "1.0",
+    "disclaimer": (
+        "LeadForge AI is a lead discovery and assistance tool. We do not guarantee "
+        "results, client acquisition, or income. All outreach is initiated and sent "
+        "manually by you. We are not liable for how messages are used."
+    ),
+    "principles": [
+        "User must always initiate outreach manually.",
+        "We never auto-send messages, DMs, or emails.",
+        "We never encourage spam, mass outreach, or bulk messaging.",
+        "We respect Reddit's API rate limits and only fetch public data.",
+        "We do not guarantee outcomes — only assist with discovery and drafting.",
+    ],
+    "data_collected": [
+        "Account info: email, name, profession, skills, tone preference (you provide)",
+        "Saved leads: post title, body, subreddit, public timestamp, URL, post ID",
+        "Lead author: public Reddit username only (no private data)",
+        "Your private notes and pipeline status on saved leads",
+        "Generated message drafts (so you can review them later)",
+        "Subscription state (tier, period, billing status — payment is handled by Razorpay, never stored by us)",
+    ],
+    "data_not_collected": [
+        "We do not collect Reddit private messages, history, or activity outside the public post",
+        "We do not collect device contacts, location, or biometric data",
+        "We do not store payment card details — Razorpay handles all payment data",
+    ],
+    "how_reddit_works": (
+        "We fetch posts from a small set of public subreddits (r/forhire, r/freelance, r/slavelabour) "
+        "via Reddit's public JSON endpoints. Only the post's title, body, subreddit, timestamp, URL, "
+        "and author username are stored — no private or personal data."
+    ),
+    "how_ai_works": (
+        "We use Gemini 3 Flash to (1) score how relevant a post is for you, (2) summarize the client's need, "
+        "(3) detect spam signals, and (4) draft personalized outreach messages. AI never sends anything — "
+        "it only suggests text. You review, edit, and send manually."
+    ),
+    "user_rights": [
+        "You can delete your account and all associated data at any time (Profile → Delete Account)",
+        "You can cancel your subscription at any time (Profile → Subscription)",
+        "You can export your saved leads as JSON via support request",
+        "All actions are user-controlled — no hidden automation",
+    ],
+    "rate_limits": {
+        "free": "10 leads/day, 5 messages/day",
+        "minimum": "25 leads/day, 12 messages/day",
+        "professional": "100 leads/day, 50 messages/day",
+        "expert": "Unlimited (subject to Reddit and AI provider rate limits)",
+    },
+    "terms_summary": (
+        "By using LeadForge AI you agree: (a) to comply with Reddit's terms when contacting users you "
+        "discover here, (b) to never use this tool for spam or bulk outreach, (c) that we provide no "
+        "warranty or guarantee of income or results, (d) that you alone are responsible for the messages "
+        "you send and the consequences thereof."
+    ),
+    "support_email": "support@leadforge.app",
+}
+
+
+@api_router.get("/policy")
+async def get_policy():
+    """Public — privacy/terms/disclaimer/transparency info."""
+    return POLICY_DOC
+
+
+@api_router.delete("/account")
+async def delete_account(user: dict = Depends(get_current_user)):
+    """Hard-delete the user and all data they own. Cannot be undone."""
+    user_id = user["id"]
+    # Cancel subscription if active
+    sub_id = user.get("subscription_id")
+    if RAZORPAY_ENABLED and sub_id and not str(sub_id).startswith("demo_sub_"):
+        try:
+            razorpay_client.subscription.cancel(sub_id, {"cancel_at_cycle_end": 0})
+        except Exception as e:
+            logger.warning(f"Subscription cancel during account delete failed: {e}")
+    # Delete owned data
+    deleted = {
+        "user_leads": (await db.user_leads.delete_many({"user_id": user_id})).deleted_count,
+        "messages": (await db.messages.delete_many({"user_id": user_id})).deleted_count,
+        "invoices": (await db.invoices.delete_many({"user_id": user_id})).deleted_count,
+    }
+    # Remove user's verified marks from shared leads
+    await db.leads.update_many({"verified_by": user_id}, {"$pull": {"verified_by": user_id}})
+    # Finally remove the user
+    await db.users.delete_one({"id": user_id})
+    return {"deleted": True, "removed": deleted}
 
 
 # ============== Billing / Subscriptions (Razorpay) ==============

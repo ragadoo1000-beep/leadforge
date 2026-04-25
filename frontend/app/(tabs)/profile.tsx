@@ -7,6 +7,8 @@ import {
   ScrollView,
   Switch,
   ActivityIndicator,
+  Alert,
+  Platform,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter, useFocusEffect } from "expo-router";
@@ -184,6 +186,66 @@ export default function ProfileScreen() {
             <Text style={styles.rowSub}>{user?.profession} · {user?.tone_preference}</Text>
           </View>
           <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          testID="how-it-works-btn"
+          style={styles.row}
+          onPress={() => router.push("/compliance")}
+          activeOpacity={0.7}
+        >
+          <Ionicons
+            name="shield-checkmark-outline"
+            size={18}
+            color={colors.primary}
+            style={{ marginRight: space.sm }}
+          />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.rowTitle}>How LeadForge Works</Text>
+            <Text style={styles.rowSub}>Privacy · Terms · Disclaimer · Data we store</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          testID="delete-account-btn"
+          style={[styles.row, { borderColor: colors.error }]}
+          onPress={() => {
+            const confirmDelete = async () => {
+              try {
+                await api.deleteAccount();
+                await logout();
+                router.replace("/login");
+              } catch (e: any) {
+                Alert.alert("Error", e.message || "Could not delete account");
+              }
+            };
+            const message =
+              "This permanently removes your account, saved leads, messages, invoices, and cancels any subscription. This cannot be undone.";
+            if (Platform.OS === "web") {
+              if (typeof window !== "undefined" && window.confirm(message)) {
+                confirmDelete();
+              }
+            } else {
+              Alert.alert("Delete Account?", message, [
+                { text: "Cancel", style: "cancel" },
+                { text: "Delete Forever", style: "destructive", onPress: confirmDelete },
+              ]);
+            }
+          }}
+          activeOpacity={0.7}
+        >
+          <Ionicons
+            name="trash-outline"
+            size={18}
+            color={colors.error}
+            style={{ marginRight: space.sm }}
+          />
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.rowTitle, { color: colors.error }]}>Delete Account</Text>
+            <Text style={styles.rowSub}>Permanently erase all your data</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={colors.error} />
         </TouchableOpacity>
 
         <View style={{ height: space.lg }} />

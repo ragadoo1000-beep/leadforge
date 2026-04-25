@@ -111,4 +111,8 @@ export const api = {
   verifyPayment: (body: any) =>
     request("/billing/verify", { method: "POST", body: JSON.stringify(body) }),
   cancelSubscription: () => request("/billing/cancel", { method: "POST" }),
+
+  // Compliance
+  getPolicy: () => request("/policy"),
+  deleteAccount: () => request("/account", { method: "DELETE" }),
 };

@@ -161,6 +161,12 @@ export default function MessageScreen() {
             <Text style={styles.tip}>
               💡 Tip: Edit before sending. Personal touches outperform AI-perfect copy.
             </Text>
+            <View style={styles.complianceBanner} testID="manual-send-banner">
+              <Ionicons name="hand-left-outline" size={14} color={colors.warning} />
+              <Text style={styles.complianceText}>
+                You must initiate this outreach manually. LeadForge never sends messages on your behalf.
+              </Text>
+            </View>
           </>
         )}
       </ScrollView>
@@ -212,6 +218,24 @@ const styles = StyleSheet.create({
   },
   primaryText: { fontFamily: fonts.bodySemi, fontSize: 12, color: "#fff", letterSpacing: 1.5 },
   tip: { marginTop: space.md, fontFamily: fonts.body, fontSize: 12, color: colors.textTertiary, lineHeight: 18 },
+  complianceBanner: {
+    marginTop: space.md,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: space.sm,
+    padding: space.sm,
+    backgroundColor: colors.warningBg,
+    borderColor: colors.warning,
+    borderWidth: 1,
+    borderRadius: radii.md,
+  },
+  complianceText: {
+    flex: 1,
+    fontFamily: fonts.bodyMedium,
+    fontSize: 11,
+    color: colors.warning,
+    lineHeight: 15,
+  },
   genBox: { padding: space.xl, alignItems: "center", gap: space.md, backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1, borderRadius: radii.md },
   genText: { fontFamily: fonts.body, color: colors.textSecondary },
   errText: { color: colors.error, fontFamily: fonts.body, textAlign: "center" },
