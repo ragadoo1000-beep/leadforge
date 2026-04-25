@@ -1,0 +1,44 @@
+{
+  "summary": "First-iteration full-stack review of LeadForge AI. Backend: 34/34 pytest cases PASS — auth (register/login/me/profile/toggle-premium/check-in), leads (fetch with demo_mode fallback, feed, detail, AI message gen with LLM-budget-exhausted fallback), CRM (save/update/list user-leads), invoices (create/list), stats, leaderboard, and auth protection on 13 endpoints. Frontend: All critical flows verified on mobile viewport (390x844) — login → feed renders 20 lead cards with score badge + intent pill + subreddit tag; lead detail shows full post, AI summary, status chips, notes input, generate-message CTA; AI message screen works with Reddit DM/Email tabs, regenerate, copy and tone-switching (live LLM call returned a real Casual DM despite earlier budget warnings — generation seems to work intermittently or fallback worked); CRM Kanban with all 5 status tabs; Invoice form accepts input; Profile tab shows stats, premium toggle (Free↔Premium), leaderboard, edit profile, sign-out; registration → onboarding wizard renders with all profession/skill/experience/tone chips. Dark modern theme is consistent and design quality is high.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/", "issue": "Root endpoint returns 404 because @api_router.get('/') is declared AFTER app.include_router(api_router) on line 758. Move the root handler above the include, or include the router again. Cosmetic only — no client uses it."},
+      {"endpoint": "POST /api/leads/fetch & /api/leads/generate-message", "issue": "Emergent LLM key budget exhausted intermittently (Max budget: 0.001, current cost ~0.0017 per backend.err.log). Fallback paths trigger correctly so endpoints still return 200 with valid (but generic) score=50/intent=Medium and template messages. Main agent should top-up the EMERGENT_LLM_KEY budget for a production-quality demo."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "app/(tabs)/invoice.tsx", "issue": "After tapping GENERATE & SHARE PDF, form fields are not cleared and the 'Past Invoices' list still shows 'No invoices yet.' even though backend POST /api/invoices works. Likely the UI does not refresh the past-invoices list after creation, or the create call only fires after the expo-print promise resolves (which may silently fail on web). Verify the POST is fired before/independently of the PDF call and refetch invoices after success.", "testID": "invoice-generate-btn", "priority": "MEDIUM"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "CRM /crm", "issues": ["Pipeline kanban has 5 columns but only 2.5 fit per viewport on 390px width — horizontal scroll works but a small visual hint (e.g. fade gradient on the right edge) would improve discoverability. Not a defect."]}
+    ],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_leadforge_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(MINOR) Move @api_router.get('/') above app.include_router(api_router) in /app/backend/server.py so GET /api/ returns 200 instead of 404.",
+    "(MEDIUM) In /app/frontend/app/(tabs)/invoice.tsx, after creating the invoice fire POST /api/invoices first, then trigger expo-print, and refetch GET /api/invoices to refresh the 'Past Invoices' list. Currently the list does not update after creation in the web preview.",
+    "(OPTIONAL) Top-up EMERGENT_LLM_KEY budget — current $0.001 limit is exhausted, so AI scoring/message generation falls back to canned responses on most calls."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 760 lines — could be split into routers (auth, leads, crm, invoices, stats) for maintainability if it grows.",
+    "ai_score_lead and generate_message both share LlmChat boilerplate — extract a small helper.",
+    "leads/feed and userleads endpoints already correctly exclude _id and use UUID `id` field — good.",
+    "CORS allows '*' with allow_credentials=True — browsers reject this combo for cookie auth, but app uses Bearer tokens so it's fine. Still worth tightening for production.",
+    "Frontend uses EXPO_PUBLIC_BACKEND_URL (Expo standard) instead of EXPO_BACKEND_URL referenced in the system prompt — both work, this is correct for Expo SDK 50+."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_leadforge_api.py (created)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "~95%"},
+  "seed_data_creation": "Created 1 fresh test user (TEST_<uuid>@leadforge.io) and 1 UI registration user (uitest_<ts>@leadforge.io). Also created 1 TEST invoice and CRM entries for the seeded test@leadforge.io user. All test data prefixed with TEST_ for easy cleanup.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "All backend endpoints under /api are working (34/34 pytest pass). Reddit IP is blocked from this dev container so /api/leads/fetch ALWAYS returns demo_mode:true with 10 seeded leads — this is expected and correct. Emergent LLM budget exhausts quickly so fallback responses are common; do not flag generic AI messages as a bug. Frontend testIDs follow kebab-case and are comprehensive. Note: Expo Router tab navigator keeps previous-tab DOM mounted hidden, so document.body.innerText returns text from all tabs concatenated — use screenshots or scoped selectors for verification, not innerText. Bear token in AsyncStorage key 'leadforge_token'."
+}
