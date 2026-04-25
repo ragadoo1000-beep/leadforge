@@ -66,6 +66,26 @@ Per `/app/design_guidelines.json` — "Tactical Minimalism" archetype:
 - **PDFs:** `expo-print` HTML→PDF + `expo-sharing` for cross-platform share sheet
 - **No payment integration** in MVP per spec section 10
 
+## Tech Decisions / Notes
+- **Mobile-first:** Bearer tokens (not cookies) for auth — works with AsyncStorage
+- **Reddit:** Public JSON endpoints (no OAuth) → graceful demo fallback
+- **PDFs:** `expo-print` HTML→PDF + `expo-sharing` for cross-platform share sheet
+- **No payment integration** in MVP per spec section 10
+
+## Iteration 2 Additions (Social Auth + Lead Verification)
+
+### Social Login
+- **Google:** Emergent-managed OAuth. Frontend redirects to `https://auth.emergentagent.com/` with the app's preview URL as redirect target. Lands on `/auth-callback` with `#session_id=...` in fragment. Backend `/api/auth/google-session` exchanges the session_id for our JWT via Emergent's `/session-data` endpoint, find-or-creates user, returns standard JWT.
+- **Apple:** Native `expo-apple-authentication` (iOS only — button auto-hidden elsewhere via `Platform.OS === "ios"` + `AppleAuthentication.isAvailableAsync()`). Backend `/api/auth/apple` verifies the Apple identity token via JWKS at `https://appleid.apple.com/auth/keys` (RS256), accepts email-on-first-login, falls back to `apple_<sub>@apple.local` for repeat sign-ins.
+
+### Lead Verification (4 signals)
+1. **AI Trust Score (spam_score 0-100)** — produced by Gemini at scoring time alongside lead score; includes `spam_flags` array (e.g., `no-budget`, `vague-scope`, `mlm-or-pyramid`, `looks-legit`). Heuristic fallback if LLM fails.
+2. **Poster Reputation** — `/api/leads/{id}/verify` fetches Reddit's `/user/{name}/about.json`, computes a trust score from karma + account age. Demo fallback (deterministic from username) when Reddit is blocked. Returns `Trusted` / `Caution` / `Risky` label.
+3. **URL Freshness** — HEAD/GET on the Reddit URL to detect deleted/removed posts. Demo mode returns `alive=true`.
+4. **Community-Verified** — `/api/leads/{id}/mark-verified` toggles current user in `verified_by[]`. First mark awards +3 XP. UI shows "N freelancers confirmed legit".
+
+All four signals render in a single **VERIFICATION** panel on the Lead Detail screen with Run Check + Mark Legit buttons.
+
 ## Future / Backlog
 - Real Stripe integration for premium upgrade
 - Reddit OAuth credentials (when user provides them) for un-blocked access
