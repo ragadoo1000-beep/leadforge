@@ -110,6 +110,32 @@ All four signals render in a single **VERIFICATION** panel on the Lead Detail sc
 - `FadeInDown` + `FadeIn` staggered on the upgrade screen (header, banner, plan cards, CTA).
 - Profile theme toggle uses native Switch animation.
 
+## Iteration 4 — Compliance, Safety & Control Layer
+
+The app is now hardened against spam/automation misuse with 8 explicit safety rules baked in.
+
+### Strengthened AI prompts
+- Both lead-scoring and message-generation system prompts now explicitly forbid: spam-like output, generic templates, guarantees of results/income/clients, urgency or pressure tactics, mass-outreach encouragement.
+- Message prompts require referencing something **specific** from the actual post, proving each draft is personalized (not blasted).
+
+### Account Deletion (User Rights)
+- `DELETE /api/account` (auth required) hard-deletes the user, all their `user_leads`, `messages`, `invoices`, removes their entry from any lead's `verified_by[]`, and cancels their Razorpay subscription. Login with same credentials afterwards correctly fails.
+- UI in Profile → "Delete Account" with double-confirmation (web `confirm()` / native `Alert`).
+
+### Transparency Endpoint + UI
+- `GET /api/policy` (public) returns a single canonical `POLICY_DOC` containing: version, disclaimer, 5 principles, data-collected list (6 items), data-not-collected list (3 items), how Reddit data is fetched, how AI is used, user rights (4 items), rate limits per tier, terms summary, support email.
+- New `/compliance` screen ("How LeadForge Works") rendered from this endpoint — fully theme-aware, accessible from Profile.
+
+### Compliance Banner on Message Generator
+Persistent warning under every generated message: *"You must initiate this outreach manually. LeadForge never sends messages on your behalf."* — `testID="manual-send-banner"`.
+
+### What is intentionally **NOT** built
+- ❌ No bulk/auto messaging buttons
+- ❌ No background message scheduling
+- ❌ No Reddit DM auto-send (only Copy + manual paste)
+- ❌ No Reddit user PII beyond public username
+- ❌ No payment card storage (Razorpay handles all PCI)
+
 ## Future / Backlog
 - Real Stripe integration for premium upgrade
 - Reddit OAuth credentials (when user provides them) for un-blocked access
