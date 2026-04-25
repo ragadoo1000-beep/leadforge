@@ -19,9 +19,22 @@ import {
   GeistMono_700Bold,
 } from "@expo-google-fonts/geist-mono";
 import { AuthProvider } from "../src/contexts/AuthContext";
-import { colors } from "../src/theme";
+import { ThemeProvider, useTheme } from "../src/contexts/ThemeContext";
 
 SplashScreen.preventAutoHideAsync().catch(() => {});
+
+function ThemedStack() {
+  const { colors } = useTheme();
+  return (
+    <Stack
+      screenOptions={{
+        headerShown: false,
+        contentStyle: { backgroundColor: colors.background },
+        animation: "slide_from_right",
+      }}
+    />
+  );
+}
 
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({
@@ -46,26 +59,22 @@ export default function RootLayout() {
       <View
         style={{
           flex: 1,
-          backgroundColor: colors.background,
+          backgroundColor: "#F4F5F8",
           justifyContent: "center",
           alignItems: "center",
         }}
       >
-        <ActivityIndicator color={colors.primary} />
+        <ActivityIndicator color="#2D52F5" />
       </View>
     );
   }
 
   return (
-    <AuthProvider>
-      <StatusBar style="light" />
-      <Stack
-        screenOptions={{
-          headerShown: false,
-          contentStyle: { backgroundColor: colors.background },
-          animation: "slide_from_right",
-        }}
-      />
-    </AuthProvider>
+    <ThemeProvider>
+      <AuthProvider>
+        <StatusBar style="auto" />
+        <ThemedStack />
+      </AuthProvider>
+    </ThemeProvider>
   );
 }

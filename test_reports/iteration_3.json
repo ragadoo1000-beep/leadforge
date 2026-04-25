@@ -1,0 +1,55 @@
+{
+  "summary": "Iteration 3 — Razorpay billing module + UI overhaul (light/dark theme + PressScale animations) tested end-to-end. 13/13 backend pytest cases passed. Frontend /upgrade renders all 3 tier cards, period toggle, MOST POPULAR + SAVE 20% badges, payment chips, active trial banner with Cancel; Profile theme-toggle flips light↔dark theme correctly with AsyncStorage persistence. Feed/login flows still work. One minor visual glitch noted on the period toggle.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "upgrade.tsx — period toggle row",
+        "issue": "When Annual is active, the Monthly pill text appears to overlap with the Annual button + SAVE 20% inline pill, making the row look squished on a 390px viewport (the inline SAVE 20% badge inside the Annual flex:1 button pushes width beyond what the Monthly side allows). Visual only — taps still register and selection works correctly.",
+        "testID": "period-monthly / period-annual",
+        "priority": "LOW"
+      }
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {
+        "screen": "/upgrade — period toggle",
+        "issues": [
+          "Annual button width grows due to inline 'SAVE 20%' badge breaking equal-width assumption from `flex:1`. Consider moving the SAVE 20% badge to absolute position or rendering it outside the flex children so both pills stay equal width."
+        ]
+      }
+    ],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_billing.py",
+    "/app/test_reports/pytest/iteration_3.xml"
+  ],
+  "action_items": [
+    "Optional: fix the period-toggle visual squish by absolute-positioning the SAVE 20% pill (e.g., position:absolute, right:8, top:-6 on the badge) so Monthly/Annual buttons render as equal-width halves.",
+    "When real Razorpay keys are added later, re-test /billing/create-subscription live path (short_url returned, subscription pending → active via webhook) and /billing/verify with valid HMAC."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~1370 lines — consider splitting billing endpoints, social auth, and lead/AI logic into separate modules for maintainability.",
+    "create_subscription demo path sets is_premium=true but the legacy /auth/toggle-premium endpoint still exists; both paths can mutate is_premium independently which could confuse state. Suggest deprecating toggle-premium or routing it through the same plan_tier fields.",
+    "billing/webhook returns 200 even when user_id can't be resolved (silent drop). This is fine for Razorpay's retry semantics but worth logging warn-level when an event is dropped.",
+    "In get_user_limits, expert tier returns 100000 as 'unlimited' — fine for now but consider sentinel value (None or -1) and updating fetch_leads/generate-message to skip the cap entirely.",
+    "ThemeContext: setMode prop is exported but Profile only uses toggle; consider exporting only what's needed.",
+    "PressScale uses Animated.View with `flex:1` always — when wrapping fixed-size icons (e.g., back-btn 38x38) this is harmless but in row layouts it might unintentionally stretch."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_billing.py (new)"
+  ],
+  "success_rate": {
+    "backend": "100% (13/13 billing tests passed)",
+    "frontend": "~95% (all functional checks pass; 1 minor layout glitch on period toggle)"
+  },
+  "seed_data_creation": "Created multiple TEST_billing_<uuid>@leadforge.io users via /api/auth/register inside test fixtures (module-scoped). Each test run creates 1-2 fresh users; existing test@leadforge.io user already on Professional Trial from prior smoke test was used for the Pro-trial limits assertion.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Razorpay is in demo_mode (RAZORPAY_KEY_ID empty). All billing endpoints exercised through demo path: create-subscription returns demo_mode:true with demo_sub_<uuid> id; cancel works without calling Razorpay; verify returns 400 'Razorpay not configured'; webhook accepts events without signature when RAZORPAY_WEBHOOK_SECRET is empty. The existing test user is currently on Professional TRIAL — to test fresh subscription flow, use /api/auth/register to create a new user. Frontend testIDs verified: plan-minimum, plan-professional, plan-expert, period-monthly, period-annual, subscribe-btn, cancel-btn, back-btn, theme-toggle, upgrade-btn. Theme toggle persists to AsyncStorage key 'leadforge_theme'.",
+  "rca_of_issue": "N/A — no functional bugs found in iter3 scope. Period-toggle visual glitch RCA: the styles.periodBtn has flex:1 but the Annual button additionally contains an inline saveBadge child, which inflates its intrinsic content width and creates uneven distribution under narrow viewports. Fix: position the saveBadge absolutely (top:-6, right:8) instead of as a flex sibling."
+}

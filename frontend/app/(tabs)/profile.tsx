@@ -13,9 +13,12 @@ import { useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { api } from "../../src/lib/api";
 import { useAuth } from "../../src/contexts/AuthContext";
-import { colors, fonts, radii, space } from "../../src/theme";
+import { useTheme } from "../../src/contexts/ThemeContext";
+import { fonts, radii, space, cardShadow } from "../../src/theme";
 
 export default function ProfileScreen() {
+  const { colors, mode, toggle } = useTheme();
+  const styles = makeStyles(colors, mode);
   const { user, logout, refresh } = useAuth();
   const router = useRouter();
   const [stats, setStats] = useState<any>(null);
@@ -121,6 +124,27 @@ export default function ProfileScreen() {
 
         <View style={{ height: space.lg }} />
         <Text style={styles.sectionLabel}>SETTINGS</Text>
+
+        <View style={styles.row}>
+          <Ionicons
+            name={mode === "dark" ? "moon" : "sunny"}
+            size={18}
+            color={colors.primary}
+            style={{ marginRight: space.sm }}
+          />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.rowTitle}>{mode === "dark" ? "Dark Mode" : "Light Mode"}</Text>
+            <Text style={styles.rowSub}>Switch theme</Text>
+          </View>
+          <Switch
+            testID="theme-toggle"
+            value={mode === "dark"}
+            onValueChange={toggle}
+            trackColor={{ false: colors.border, true: colors.primary }}
+            thumbColor="#fff"
+          />
+        </View>
+
         <View style={styles.row}>
           <View style={{ flex: 1 }}>
             <Text style={styles.rowTitle}>Premium Tier</Text>
@@ -143,8 +167,8 @@ export default function ProfileScreen() {
           activeOpacity={0.7}
         >
           <View style={{ flex: 1 }}>
-            <Text style={styles.rowTitle}>View Premium Benefits</Text>
-            <Text style={styles.rowSub}>See what you unlock</Text>
+            <Text style={styles.rowTitle}>Subscription Plans</Text>
+            <Text style={styles.rowSub}>3 tiers · 7-day free trial</Text>
           </View>
           <Ionicons name="chevron-forward" size={18} color={colors.textTertiary} />
         </TouchableOpacity>
@@ -198,7 +222,7 @@ export default function ProfileScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: any, mode: "light" | "dark") => StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.background },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   overline: { fontFamily: fonts.bodyMedium, fontSize: 11, color: colors.primary, letterSpacing: 2 },
@@ -222,6 +246,7 @@ const styles = StyleSheet.create({
     flexBasis: "31%", flexGrow: 1,
     backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1,
     borderRadius: radii.md, padding: space.sm,
+    ...cardShadow(mode),
   },
   statLabel: { fontFamily: fonts.bodyMedium, fontSize: 9, color: colors.textTertiary, letterSpacing: 1.5 },
   statVal: { fontFamily: fonts.monoBold, fontSize: 22, color: colors.textPrimary, marginTop: 4 },
@@ -230,6 +255,7 @@ const styles = StyleSheet.create({
     flexDirection: "row", alignItems: "center", padding: space.md,
     backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1,
     borderRadius: radii.md, marginBottom: space.sm,
+    ...cardShadow(mode),
   },
   rowTitle: { fontFamily: fonts.bodyMedium, fontSize: 14, color: colors.textPrimary },
   rowSub: { fontFamily: fonts.body, fontSize: 12, color: colors.textSecondary, marginTop: 2 },

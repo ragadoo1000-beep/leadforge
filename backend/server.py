@@ -8,10 +8,13 @@ import os
 import re
 import uuid
 import json
+import hmac
+import hashlib
 import logging
 import bcrypt
 import jwt
 import httpx
+import razorpay
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
 
@@ -31,6 +34,12 @@ db = client[os.environ['DB_NAME']]
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGO = "HS256"
 EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
+
+RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', '').strip()
+RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', '').strip()
+RAZORPAY_WEBHOOK_SECRET = os.environ.get('RAZORPAY_WEBHOOK_SECRET', '').strip()
+RAZORPAY_ENABLED = bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_ENABLED else None
 
 app = FastAPI(title="LeadForge AI API")
 api_router = APIRouter(prefix="/api")
@@ -638,10 +647,10 @@ async def fetch_leads(payload: FetchLeadsIn, user: dict = Depends(get_current_us
         await db.users.update_one({"id": user["id"]}, {"$set": reset})
         user.update(reset)
 
-    # Free tier: max 10 leads/day
-    is_premium = user.get("is_premium", False)
+    # Free tier: max 10 leads/day; tiered users get higher caps
+    limits = get_user_limits(user)
     leads_today = user.get("leads_today", 0)
-    daily_cap = 10 if not is_premium else 1000
+    daily_cap = limits["leads_per_day"]
     remaining = max(0, daily_cap - leads_today)
     if remaining == 0:
         return {"leads": [], "remaining": 0, "limit_reached": True}
@@ -812,11 +821,11 @@ async def generate_message(payload: GenerateMessageIn, user: dict = Depends(get_
         await db.users.update_one({"id": user["id"]}, {"$set": reset})
         user.update(reset)
 
-    is_premium = user.get("is_premium", False)
+    limits = get_user_limits(user)
     msgs_today = user.get("messages_today", 0)
-    daily_cap = 5 if not is_premium else 1000
+    daily_cap = limits["messages_per_day"]
     if msgs_today >= daily_cap:
-        raise HTTPException(status_code=429, detail=f"Daily limit reached ({daily_cap}). Upgrade to Premium for unlimited.")
+        raise HTTPException(status_code=429, detail=f"Daily limit reached ({daily_cap}). Upgrade your plan for more.")
 
     lead = await db.leads.find_one({"id": payload.lead_id}, {"_id": 0})
     if not lead:
@@ -1035,6 +1044,308 @@ async def root():
     return {"status": "ok", "service": "LeadForge AI"}
 
 
+# ============== Billing / Subscriptions (Razorpay) ==============
+
+# Tier configuration (single source of truth; UI fetches via /billing/plans)
+PLAN_CATALOG = {
+    "minimum": {
+        "name": "Minimum",
+        "tagline": "For freelancers getting started",
+        "monthly_inr": 299,
+        "annual_inr": 2870,
+        "limits": {"leads_per_day": 25, "messages_per_day": 12},
+        "features": [
+            "25 AI-scored leads per day",
+            "12 AI message generations per day",
+            "Basic CRM with 5 pipeline stages",
+            "AI Trust Score (spam detection)",
+            "Manual lead verification",
+        ],
+    },
+    "professional": {
+        "name": "Professional",
+        "tagline": "For active freelancers who win deals",
+        "monthly_inr": 399,
+        "annual_inr": 3830,
+        "limits": {"leads_per_day": 100, "messages_per_day": 50},
+        "features": [
+            "100 AI-scored leads per day",
+            "50 AI message generations per day",
+            "Advanced verification (poster reputation + freshness)",
+            "Priority feed (high-intent first)",
+            "Tone customization & A/B variants",
+            "All Minimum features",
+        ],
+    },
+    "expert": {
+        "name": "Expert",
+        "tagline": "Unlimited firepower for top freelancers",
+        "monthly_inr": 499,
+        "annual_inr": 4790,
+        "limits": {"leads_per_day": 100000, "messages_per_day": 100000},
+        "features": [
+            "Unlimited leads",
+            "Unlimited AI messages",
+            "Priority AI scoring (low latency)",
+            "Advanced analytics dashboard",
+            "Early access to new sources (LinkedIn/X)",
+            "Priority support",
+            "All Professional features",
+        ],
+    },
+}
+TRIAL_DAYS = 7
+
+
+def get_user_limits(user: dict) -> dict:
+    """Return effective leads/messages caps for a user."""
+    tier = user.get("plan_tier") or "free"
+    status = user.get("subscription_status") or "free"
+    if status in ("active", "trial") and tier in PLAN_CATALOG:
+        return PLAN_CATALOG[tier]["limits"]
+    if user.get("is_premium"):
+        # Legacy demo-toggle treats premium as Expert
+        return PLAN_CATALOG["expert"]["limits"]
+    return {"leads_per_day": 10, "messages_per_day": 5}
+
+
+@api_router.get("/billing/plans")
+async def billing_plans():
+    return {
+        "plans": [
+            {"id": tier, **cfg} for tier, cfg in PLAN_CATALOG.items()
+        ],
+        "trial_days": TRIAL_DAYS,
+        "razorpay_enabled": RAZORPAY_ENABLED,
+        "razorpay_key_id": RAZORPAY_KEY_ID if RAZORPAY_ENABLED else None,
+    }
+
+
+@api_router.get("/billing/me")
+async def billing_me(user: dict = Depends(get_current_user)):
+    limits = get_user_limits(user)
+    return {
+        "plan_tier": user.get("plan_tier") or "free",
+        "plan_period": user.get("plan_period"),
+        "subscription_status": user.get("subscription_status") or "free",
+        "subscription_id": user.get("subscription_id"),
+        "trial_ends_at": user.get("trial_ends_at"),
+        "current_period_end": user.get("current_period_end"),
+        "is_premium": user.get("is_premium", False),
+        "limits": limits,
+    }
+
+
+class CreateSubscriptionIn(BaseModel):
+    tier: Literal["minimum", "professional", "expert"]
+    period: Literal["monthly", "annual"]
+
+
+def _ensure_razorpay_plan(tier: str, period: str) -> str:
+    """Get-or-create a Razorpay plan id, cached in db.razorpay_plans."""
+    return ""  # placeholder; the async flow below replaces this
+
+
+async def get_or_create_rzp_plan(tier: str, period: str) -> Optional[str]:
+    if not RAZORPAY_ENABLED:
+        return None
+    cfg = PLAN_CATALOG[tier]
+    interval_unit = "monthly" if period == "monthly" else "yearly"
+    amount_inr = cfg["monthly_inr"] if period == "monthly" else cfg["annual_inr"]
+    cache_key = f"{tier}_{period}"
+    cached = await db.razorpay_plans.find_one({"key": cache_key})
+    if cached and cached.get("plan_id"):
+        return cached["plan_id"]
+    try:
+        plan = razorpay_client.plan.create(
+            data={
+                "period": interval_unit,
+                "interval": 1,
+                "item": {
+                    "name": f"LeadForge {cfg['name']} ({period.capitalize()})",
+                    "amount": amount_inr * 100,  # paise
+                    "currency": "INR",
+                    "description": cfg["tagline"],
+                },
+            }
+        )
+        plan_id = plan["id"]
+        await db.razorpay_plans.update_one(
+            {"key": cache_key},
+            {"$set": {"plan_id": plan_id, "amount_inr": amount_inr, "period": interval_unit}},
+            upsert=True,
+        )
+        return plan_id
+    except Exception as e:
+        logger.error(f"Razorpay plan create failed: {e}")
+        return None
+
+
+@api_router.post("/billing/create-subscription")
+async def create_subscription(payload: CreateSubscriptionIn, user: dict = Depends(get_current_user)):
+    cfg = PLAN_CATALOG[payload.tier]
+    amount_inr = cfg["monthly_inr"] if payload.period == "monthly" else cfg["annual_inr"]
+    trial_ends = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+
+    if not RAZORPAY_ENABLED:
+        # Demo mode — instantly activate trial without payment, for development only
+        update = {
+            "plan_tier": payload.tier,
+            "plan_period": payload.period,
+            "subscription_status": "trial",
+            "subscription_id": f"demo_sub_{uuid.uuid4()}",
+            "trial_ends_at": trial_ends.isoformat(),
+            "current_period_end": trial_ends.isoformat(),
+            "is_premium": True,
+        }
+        await db.users.update_one({"id": user["id"]}, {"$set": update})
+        return {
+            "demo_mode": True,
+            "subscription_id": update["subscription_id"],
+            "short_url": None,
+            "message": "Demo mode active — Razorpay keys not configured. Trial granted instantly.",
+            "trial_ends_at": update["trial_ends_at"],
+        }
+
+    plan_id = await get_or_create_rzp_plan(payload.tier, payload.period)
+    if not plan_id:
+        raise HTTPException(status_code=502, detail="Could not create Razorpay plan")
+
+    start_at = int(trial_ends.timestamp())  # First charge after trial
+    total_count = 12 if payload.period == "monthly" else 5  # 12 months or 5 years
+    try:
+        sub = razorpay_client.subscription.create(
+            data={
+                "plan_id": plan_id,
+                "customer_notify": 1,
+                "quantity": 1,
+                "total_count": total_count,
+                "start_at": start_at,
+                "notes": {
+                    "user_id": user["id"],
+                    "tier": payload.tier,
+                    "period": payload.period,
+                },
+            }
+        )
+    except Exception as e:
+        logger.error(f"Razorpay subscription create failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Razorpay error: {e}")
+
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {
+            "plan_tier": payload.tier,
+            "plan_period": payload.period,
+            "subscription_id": sub["id"],
+            "subscription_status": "pending",
+            "trial_ends_at": trial_ends.isoformat(),
+        }}
+    )
+    return {
+        "subscription_id": sub["id"],
+        "short_url": sub.get("short_url"),
+        "trial_ends_at": trial_ends.isoformat(),
+        "amount_inr": amount_inr,
+        "demo_mode": False,
+    }
+
+
+class VerifyPaymentIn(BaseModel):
+    razorpay_payment_id: str
+    razorpay_subscription_id: str
+    razorpay_signature: str
+
+
+@api_router.post("/billing/verify")
+async def verify_payment(payload: VerifyPaymentIn, user: dict = Depends(get_current_user)):
+    if not RAZORPAY_ENABLED:
+        raise HTTPException(status_code=400, detail="Razorpay not configured")
+    # HMAC verification: payment_id + "|" + subscription_id, key = secret
+    body = f"{payload.razorpay_payment_id}|{payload.razorpay_subscription_id}".encode()
+    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, payload.razorpay_signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"subscription_status": "trial", "is_premium": True}}
+    )
+    return {"verified": True, "subscription_status": "trial"}
+
+
+@api_router.post("/billing/cancel")
+async def cancel_subscription(user: dict = Depends(get_current_user)):
+    sub_id = user.get("subscription_id")
+    if not sub_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    if RAZORPAY_ENABLED and not sub_id.startswith("demo_sub_"):
+        try:
+            razorpay_client.subscription.cancel(sub_id, {"cancel_at_cycle_end": 0})
+        except Exception as e:
+            logger.error(f"Razorpay cancel failed: {e}")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {
+            "subscription_status": "cancelled",
+            "is_premium": False,
+            "plan_tier": None,
+            "plan_period": None,
+        }}
+    )
+    return {"cancelled": True}
+
+
+@api_router.post("/billing/webhook")
+async def razorpay_webhook(request: Request):
+    """Receives subscription.* events from Razorpay and syncs DB."""
+    body = await request.body()
+    sig = request.headers.get("X-Razorpay-Signature", "")
+    if RAZORPAY_WEBHOOK_SECRET:
+        expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        evt = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    event_name = evt.get("event", "")
+    sub = evt.get("payload", {}).get("subscription", {}).get("entity", {})
+    if not sub:
+        return {"received": True}
+    sub_id = sub.get("id")
+    notes = sub.get("notes") or {}
+    user_id = notes.get("user_id")
+    if not user_id:
+        # Try to find by sub_id
+        u = await db.users.find_one({"subscription_id": sub_id})
+        if u:
+            user_id = u["id"]
+    if not user_id:
+        return {"received": True}
+
+    status_map = {
+        "subscription.activated": "active",
+        "subscription.charged": "active",
+        "subscription.completed": "completed",
+        "subscription.cancelled": "cancelled",
+        "subscription.halted": "halted",
+        "subscription.paused": "paused",
+        "subscription.resumed": "active",
+    }
+    new_status = status_map.get(event_name)
+    update = {}
+    if new_status:
+        update["subscription_status"] = new_status
+        update["is_premium"] = new_status in ("active", "trial")
+    if sub.get("current_end"):
+        update["current_period_end"] = datetime.fromtimestamp(
+            sub["current_end"], tz=timezone.utc
+        ).isoformat()
+    if update:
+        await db.users.update_one({"id": user_id}, {"$set": update})
+    return {"received": True, "event": event_name}
+
+
 # ============== App Setup ==============
 app.include_router(api_router)
 
@@ -1053,6 +1364,7 @@ async def startup_event():
     await db.leads.create_index("reddit_id")
     await db.user_leads.create_index([("user_id", 1), ("lead_id", 1)])
     logger.info("LeadForge AI API started")
+    logger.info(f"Razorpay enabled: {RAZORPAY_ENABLED}")
 
 
 @app.on_event("shutdown")

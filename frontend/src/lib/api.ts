@@ -99,4 +99,16 @@ export const api = {
     request(`/leads/${lead_id}/verify`, { method: "POST" }),
   toggleVerifiedFlag: (lead_id: string) =>
     request(`/leads/${lead_id}/mark-verified`, { method: "POST" }),
+
+  // Billing
+  billingPlans: () => request("/billing/plans"),
+  billingMe: () => request("/billing/me"),
+  createSubscription: (tier: string, period: string) =>
+    request("/billing/create-subscription", {
+      method: "POST",
+      body: JSON.stringify({ tier, period }),
+    }),
+  verifyPayment: (body: any) =>
+    request("/billing/verify", { method: "POST", body: JSON.stringify(body) }),
+  cancelSubscription: () => request("/billing/cancel", { method: "POST" }),
 };
