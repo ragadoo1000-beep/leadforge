@@ -730,6 +730,11 @@ async def daily_check_in(user: dict = Depends(get_current_user)):
     return {"streak": streak}
 
 
+@api_router.get("/")
+async def root():
+    return {"status": "ok", "service": "LeadForge AI"}
+
+
 # ============== App Setup ==============
 app.include_router(api_router)
 
@@ -753,8 +758,3 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown():
     client.close()
-
-
-@api_router.get("/")
-async def root():
-    return {"status": "ok", "service": "LeadForge AI"}

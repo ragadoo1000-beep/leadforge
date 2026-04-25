@@ -100,18 +100,24 @@ export default function InvoiceScreen() {
         amount: amt,
         date,
       });
-      const html = buildHtml(inv, user?.name || "");
-      const { uri } = await Print.printToFileAsync({ html });
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
-        await Sharing.shareAsync(uri, { mimeType: "application/pdf", dialogTitle: "Share Invoice" });
-      } else {
-        Alert.alert("Saved", `Invoice saved at ${uri}`);
-      }
+      // Clear form & refresh list immediately on backend success
       setClient("");
       setDesc("");
       setAmount("");
       await load();
+      // PDF generation/share is best-effort (may not work on web preview)
+      try {
+        const html = buildHtml(inv, user?.name || "");
+        const { uri } = await Print.printToFileAsync({ html });
+        const canShare = await Sharing.isAvailableAsync();
+        if (canShare) {
+          await Sharing.shareAsync(uri, { mimeType: "application/pdf", dialogTitle: "Share Invoice" });
+        } else {
+          Alert.alert("Saved", "Invoice created. PDF sharing unavailable on this platform.");
+        }
+      } catch (pdfErr: any) {
+        Alert.alert("Created", `Invoice ${inv.invoice_number} saved. PDF preview unavailable on this platform.`);
+      }
     } catch (e: any) {
       Alert.alert("Error", e.message || "Failed");
     } finally {
