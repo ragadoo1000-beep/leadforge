@@ -33,6 +33,7 @@ type AuthState = {
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
   setUser: (u: User | null) => void;
+  loginWithToken: (token: string, user: User) => Promise<void>;
 };
 
 const AuthContext = createContext<AuthState | undefined>(undefined);
@@ -72,6 +73,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch {}
   };
 
+  const loginWithToken = async (token: string, userObj: User) => {
+    await setToken(token);
+    setUser(userObj);
+    try {
+      await api.checkIn();
+    } catch {}
+  };
+
   const register = async (email: string, password: string, name: string) => {
     const res = await api.register({ email, password, name });
     await setToken(res.token);
@@ -88,7 +97,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, register, logout, refresh, setUser }}
+      value={{ user, loading, login, register, logout, refresh, setUser, loginWithToken }}
     >
       {children}
     </AuthContext.Provider>

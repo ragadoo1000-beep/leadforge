@@ -84,4 +84,19 @@ export const api = {
 
   myStats: () => request("/stats/me"),
   leaderboard: () => request("/leaderboard"),
+
+  // Social auth
+  googleSession: (session_id: string) =>
+    request("/auth/google-session", {
+      method: "POST",
+      body: JSON.stringify({ session_id }),
+    }),
+  appleAuth: (body: { identity_token: string; name?: string; email?: string }) =>
+    request("/auth/apple", { method: "POST", body: JSON.stringify(body) }),
+
+  // Lead verification
+  verifyLead: (lead_id: string) =>
+    request(`/leads/${lead_id}/verify`, { method: "POST" }),
+  toggleVerifiedFlag: (lead_id: string) =>
+    request(`/leads/${lead_id}/mark-verified`, { method: "POST" }),
 };

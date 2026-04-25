@@ -55,6 +55,37 @@ export default function LeadDetail() {
     }
   };
 
+  const [verifying, setVerifying] = useState(false);
+  const [marking, setMarking] = useState(false);
+
+  const runVerification = async () => {
+    setVerifying(true);
+    try {
+      const updated = await api.verifyLead(String(id));
+      setLead(updated);
+    } catch (e: any) {
+      Alert.alert("Error", e.message || "Verification failed");
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  const toggleVerified = async () => {
+    setMarking(true);
+    try {
+      const res = await api.toggleVerifiedFlag(String(id));
+      setLead((l: any) => ({
+        ...l,
+        i_verified: res.i_verified,
+        verified_count: res.verified_count,
+      }));
+    } catch (e: any) {
+      Alert.alert("Error", e.message);
+    } finally {
+      setMarking(false);
+    }
+  };
+
   const saveNotes = async () => {
     setSavingNotes(true);
     try {
@@ -114,6 +145,153 @@ export default function LeadDetail() {
         <View style={styles.summaryBox}>
           <Text style={styles.summaryLabel}>AI SUMMARY</Text>
           <Text style={styles.summaryText}>{lead.summary}</Text>
+        </View>
+
+        {/* ============ Verification Panel ============ */}
+        <Text style={styles.sectionLabel}>VERIFICATION</Text>
+        <View style={styles.verifyBox} testID="verification-panel">
+          {/* Spam / Trust Score (always available) */}
+          <View style={styles.verifyRow}>
+            <View style={styles.verifyIcon}>
+              <Ionicons
+                name={(lead.spam_score ?? 0) >= 70 ? "shield-checkmark" : (lead.spam_score ?? 0) >= 40 ? "shield-outline" : "warning"}
+                size={18}
+                color={
+                  (lead.spam_score ?? 0) >= 70
+                    ? colors.success
+                    : (lead.spam_score ?? 0) >= 40
+                    ? colors.warning
+                    : colors.error
+                }
+              />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.verifyTitle}>AI Trust Score</Text>
+              <Text style={styles.verifySub}>
+                {lead.spam_score ?? 60}/100
+                {lead.spam_flags?.length
+                  ? ` · ${(lead.spam_flags as string[]).slice(0, 3).join(", ")}`
+                  : ""}
+              </Text>
+            </View>
+          </View>
+
+          {/* Poster Reputation */}
+          <View style={styles.verifyRow}>
+            <View style={styles.verifyIcon}>
+              <Ionicons
+                name={lead.poster_trust ? "person-circle" : "person-outline"}
+                size={18}
+                color={
+                  lead.poster_trust
+                    ? lead.poster_trust.score >= 70
+                      ? colors.success
+                      : lead.poster_trust.score >= 40
+                      ? colors.warning
+                      : colors.error
+                    : colors.textTertiary
+                }
+              />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.verifyTitle}>
+                Poster: u/{lead.author}
+              </Text>
+              <Text style={styles.verifySub}>
+                {lead.poster_trust
+                  ? `${lead.poster_trust.label} · ${lead.poster_profile?.karma ?? 0} karma · ${
+                      lead.poster_profile?.age_days ?? 0
+                    }d old${lead.poster_profile?.source === "demo" ? " (demo)" : ""}`
+                  : "Tap Verify to check reputation"}
+              </Text>
+            </View>
+          </View>
+
+          {/* Freshness */}
+          <View style={styles.verifyRow}>
+            <View style={styles.verifyIcon}>
+              <Ionicons
+                name={
+                  lead.freshness ? (lead.freshness.alive ? "checkmark-circle" : "close-circle") : "time-outline"
+                }
+                size={18}
+                color={
+                  lead.freshness
+                    ? lead.freshness.alive
+                      ? colors.success
+                      : colors.error
+                    : colors.textTertiary
+                }
+              />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.verifyTitle}>Post Freshness</Text>
+              <Text style={styles.verifySub}>
+                {lead.freshness
+                  ? lead.freshness.alive
+                    ? `Live${lead.freshness.source === "demo" ? " (demo)" : ""}`
+                    : "Removed or unreachable"
+                  : "Tap Verify to check"}
+              </Text>
+            </View>
+          </View>
+
+          {/* Community verified count */}
+          <View style={styles.verifyRow}>
+            <View style={styles.verifyIcon}>
+              <Ionicons
+                name={(lead.verified_count ?? 0) > 0 ? "people" : "people-outline"}
+                size={18}
+                color={(lead.verified_count ?? 0) > 0 ? colors.primary : colors.textTertiary}
+              />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.verifyTitle}>Community-Verified</Text>
+              <Text style={styles.verifySub}>
+                {lead.verified_count ?? 0} freelancer
+                {(lead.verified_count ?? 0) === 1 ? "" : "s"} confirmed legit
+              </Text>
+            </View>
+          </View>
+
+          <View style={{ flexDirection: "row", gap: space.sm, marginTop: space.sm }}>
+            <TouchableOpacity
+              testID="run-verification-btn"
+              style={[styles.verifyBtn, verifying && { opacity: 0.7 }]}
+              onPress={runVerification}
+              disabled={verifying}
+              activeOpacity={0.8}
+            >
+              {verifying ? (
+                <ActivityIndicator color={colors.textPrimary} size="small" />
+              ) : (
+                <>
+                  <Ionicons name="scan-outline" size={14} color={colors.textPrimary} />
+                  <Text style={styles.verifyBtnText}>RUN CHECK</Text>
+                </>
+              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              testID="mark-verified-btn"
+              style={[
+                styles.verifyBtn,
+                lead.i_verified && { borderColor: colors.primary, backgroundColor: "rgba(255,92,0,0.15)" },
+                marking && { opacity: 0.7 },
+              ]}
+              onPress={toggleVerified}
+              disabled={marking}
+              activeOpacity={0.8}
+            >
+              <Ionicons
+                name={lead.i_verified ? "checkmark-done" : "thumbs-up-outline"}
+                size={14}
+                color={lead.i_verified ? colors.primary : colors.textPrimary}
+              />
+              <Text style={[styles.verifyBtnText, lead.i_verified && { color: colors.primary }]}>
+                {lead.i_verified ? "VERIFIED" : "MARK LEGIT"}
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         <Text style={styles.sectionLabel}>FULL POST</Text>
@@ -239,4 +417,36 @@ const styles = StyleSheet.create({
     borderColor: colors.border, borderWidth: 1, borderRadius: radii.md,
   },
   secondaryText: { color: colors.textPrimary, fontFamily: fonts.bodySemi, fontSize: 12, letterSpacing: 1.5 },
+  verifyBox: {
+    backgroundColor: colors.surface,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radii.md,
+    padding: space.md,
+    gap: space.sm,
+  },
+  verifyRow: { flexDirection: "row", alignItems: "center", gap: space.sm },
+  verifyIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: colors.surfaceElevated,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  verifyTitle: { fontFamily: fonts.bodySemi, fontSize: 13, color: colors.textPrimary },
+  verifySub: { fontFamily: fonts.body, fontSize: 11, color: colors.textSecondary, marginTop: 1 },
+  verifyBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 10,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: radii.md,
+    backgroundColor: colors.surfaceElevated,
+  },
+  verifyBtnText: { fontFamily: fonts.bodySemi, fontSize: 11, color: colors.textPrimary, letterSpacing: 1 },
 });

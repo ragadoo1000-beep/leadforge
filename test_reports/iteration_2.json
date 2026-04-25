@@ -1,0 +1,35 @@
+{
+  "summary": "Iteration 2 — tested 3 new features (Google login, Apple Sign-In, multi-signal lead verification). Backend: 9/9 new pytest cases PASS plus existing 34/34 still pass = 43/43 total backend. New endpoints validated: POST /api/auth/google-session (invalid session_id → 401), POST /api/auth/apple (malformed JWT → 401, JWKS roundtrip works), POST /api/leads/{id}/verify (populates poster_profile/poster_trust/freshness using demo data since Reddit blocked from this container — alive=true, karma+age+label all populated, deterministic via demo_poster_profile), POST /api/leads/{id}/mark-verified (toggles user in verified_by, increments/decrements verified_count, awards +3 XP first time), GET /api/leads/{id} now returns spam_score/spam_flags/verified_by/i_verified/verified_count fields. Frontend (mobile viewport 390x844): Login screen shows CONTINUE WITH GOOGLE button correctly above email/password form; Apple button correctly HIDDEN on web (Platform.OS !== 'ios'); clicking Google redirects to https://auth.emergentagent.com/?redirect=https%3A%2F%2Fai-outreach-17.preview.emergentagent.com%2Fauth-callback (correctly URL-encoded backend callback URL); /auth-callback page renders the loading state with proper testID and gracefully redirects to /login when no session_id is in the URL hash; Lead Detail VERIFICATION panel renders all 4 rows (AI Trust Score, Poster, Post Freshness, Community-Verified); RUN CHECK button populates poster karma (11188), age (544d), Trusted label, and Live freshness status (demo source as expected); MARK LEGIT button toggles label between MARK LEGIT ↔ VERIFIED, counter goes 0→1→0 correctly. NO React render errors and NO pageerrors observed in console. All testIDs from the spec exist and are functional.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/test_leadforge_api.py",
+    "/app/test_reports/pytest/iteration_2.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "find_or_create_social_user correctly excludes _id and password_hash; bcrypt no longer stores hash for social users (empty string) — login endpoint still rejects them because verify_password('', '') returns False (bcrypt.checkpw raises and is caught). Good.",
+    "_verify_apple_identity_token correctly fetches JWKS, validates RS256 signature, skips audience check (commented why — bundle ID varies), enforces issuer == https://appleid.apple.com.",
+    "demo_poster_profile uses deterministic seed (sum of ord chars) — same author always returns same karma/age, which is good for stable UX in demo mode.",
+    "compute_poster_trust score capping (0-100) and label thresholds (>=70 Trusted, >=40 Caution else Risky) match the visual UI thresholds for icon coloring — consistent.",
+    "mark-verified is correctly idempotent for the toggle (set semantics) and only awards XP on the 'marked' transition, not on 'unmarked'.",
+    "Login screen correctly hides Apple button on web by checking Platform.OS === 'ios' AND appleAvailable — both gates required."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py (created)"
+  ],
+  "success_rate": {"backend": "100% (9/9 new + 34/34 existing)", "frontend": "100%"},
+  "seed_data_creation": "Used existing test@leadforge.io user. test_mark_verified_toggle leaves the lead's verified_by in same state as it found it (toggles twice). No new test data created.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "All 3 new features verified end-to-end. Reddit IP is blocked from this container so /api/leads/{id}/verify always uses demo_poster_profile + alive=true; this is expected per spec. Apple JWKS endpoint IS reachable from container (apple_auth returns 401 with proper 'Invalid Apple token' detail, not 502). Emergent OAuth session-data endpoint IS reachable (returns 401 for invalid session_id, not 502). Note: For full E2E Google sign-in test, you'd need a real Emergent OAuth flow — we only verified the redirect URL construction, which is exactly what the spec asked for. testIDs in use: google-signin-btn, apple-signin-btn (iOS only), auth-callback-screen, verification-panel, run-verification-btn, mark-verified-btn."
+}

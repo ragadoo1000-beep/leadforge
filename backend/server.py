@@ -196,6 +196,140 @@ async def toggle_premium(user: dict = Depends(get_current_user)):
     return {"is_premium": new_val}
 
 
+# ============== Social Auth (Google + Apple) ==============
+async def find_or_create_social_user(email: str, name: str, picture: Optional[str] = None, provider: str = "google") -> dict:
+    email = email.lower()
+    user = await db.users.find_one({"email": email})
+    if user:
+        updates = {"auth_provider": provider}
+        if picture and not user.get("picture"):
+            updates["picture"] = picture
+        if not user.get("name"):
+            updates["name"] = name
+        await db.users.update_one({"id": user["id"]}, {"$set": updates})
+        user.update(updates)
+        return user
+    user_id = str(uuid.uuid4())
+    user_doc = {
+        "id": user_id,
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "auth_provider": provider,
+        "password_hash": "",  # no password for social
+        "profession": "",
+        "skills": [],
+        "experience_level": "Beginner",
+        "portfolio_links": [],
+        "pricing_range": "",
+        "tone_preference": "Casual",
+        "is_premium": False,
+        "xp": 0,
+        "streak": 0,
+        "last_active_date": None,
+        "messages_today": 0,
+        "leads_today": 0,
+        "today_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "onboarded": False,
+    }
+    await db.users.insert_one(user_doc)
+    return user_doc
+
+
+class GoogleSessionIn(BaseModel):
+    session_id: str
+
+
+@api_router.post("/auth/google-session")
+async def google_session(payload: GoogleSessionIn):
+    """Exchange an Emergent OAuth session_id for our JWT.
+    REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as hc:
+            r = await hc.get(
+                "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+                headers={"X-Session-ID": payload.session_id},
+            )
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid or expired Google session")
+        data = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Google session exchange failed: {e}")
+        raise HTTPException(status_code=502, detail="Could not verify Google session")
+
+    email = data.get("email")
+    name = data.get("name") or (email.split("@")[0] if email else "User")
+    if not email:
+        raise HTTPException(status_code=400, detail="Google session missing email")
+    user = await find_or_create_social_user(email, name, data.get("picture"), "google")
+    token = create_token(user["id"], user["email"])
+    user.pop("_id", None)
+    user.pop("password_hash", None)
+    return {"token": token, "user": user}
+
+
+class AppleAuthIn(BaseModel):
+    identity_token: str
+    name: Optional[str] = None
+    email: Optional[str] = None  # Apple only sends email on first login
+
+
+async def _verify_apple_identity_token(identity_token: str) -> dict:
+    """Verify Apple ID token via JWKS. Returns claims."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as hc:
+            keys_resp = await hc.get("https://appleid.apple.com/auth/keys")
+        jwks = keys_resp.json()
+        unverified_header = jwt.get_unverified_header(identity_token)
+        kid = unverified_header.get("kid")
+        key = None
+        for k in jwks.get("keys", []):
+            if k.get("kid") == kid:
+                key = k
+                break
+        if not key:
+            raise HTTPException(status_code=401, detail="Apple key not found")
+        from jwt.algorithms import RSAAlgorithm
+        public_key = RSAAlgorithm.from_jwk(json.dumps(key))
+        # We don't enforce audience because the bundle ID may vary per build environment
+        claims = jwt.decode(
+            identity_token,
+            public_key,
+            algorithms=["RS256"],
+            options={"verify_aud": False},
+        )
+        if claims.get("iss") != "https://appleid.apple.com":
+            raise HTTPException(status_code=401, detail="Invalid Apple token issuer")
+        return claims
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Apple token verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid Apple token")
+
+
+@api_router.post("/auth/apple")
+async def apple_auth(payload: AppleAuthIn):
+    claims = await _verify_apple_identity_token(payload.identity_token)
+    email = claims.get("email") or payload.email
+    sub = claims.get("sub")
+    if not email:
+        # Apple omits email on subsequent sign-ins — synthesize a stable identifier
+        if not sub:
+            raise HTTPException(status_code=400, detail="Apple token missing both email and sub")
+        email = f"apple_{sub[:24]}@apple.local"
+    name = payload.name or email.split("@")[0]
+    user = await find_or_create_social_user(email, name, None, "apple")
+    token = create_token(user["id"], user["email"])
+    user.pop("_id", None)
+    user.pop("password_hash", None)
+    return {"token": token, "user": user}
+
+
 # ============== Reddit Fetching ==============
 async def fetch_reddit_posts(subreddit: str, hours: int = 72) -> List[dict]:
     url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25&raw_json=1"
@@ -344,7 +478,7 @@ def get_demo_posts() -> List[dict]:
 
 # ============== AI Lead Scoring ==============
 async def ai_score_lead(title: str, body: str) -> dict:
-    """Score a lead using Gemini Flash. Returns {score, intent, summary}."""
+    """Score a lead using Gemini Flash. Returns {score, intent, summary, spam_score, spam_flags}."""
     system = (
         "You are a lead qualification AI for freelancers. Analyze Reddit posts where "
         "people might be hiring. Return ONLY valid JSON, no markdown, no extra text."
@@ -353,11 +487,14 @@ async def ai_score_lead(title: str, body: str) -> dict:
 - "score": integer 0-100 (lead quality; high if clear requirement, budget mentioned, urgency)
 - "intent": "High" | "Medium" | "Low"
 - "summary": one short sentence describing the client need (max 20 words)
+- "spam_score": integer 0-100 (TRUST score, higher = more legitimate, lower = more spammy)
+- "spam_flags": array of short strings flagging issues, choose from:
+   ["no-budget", "vague-scope", "too-short", "suspicious-url", "mlm-or-pyramid", "low-effort", "duplicate-pattern", "unrealistic-rate", "looks-legit"]
 
 Post Title: {title}
 Post Body: {body[:1200]}
 
-Return ONLY JSON like: {{"score": 85, "intent": "High", "summary": "..."}}"""
+Return ONLY JSON like: {{"score": 85, "intent": "High", "summary": "...", "spam_score": 90, "spam_flags": ["looks-legit"]}}"""
     try:
         chat = LlmChat(
             api_key=EMERGENT_LLM_KEY,
@@ -365,19 +502,124 @@ Return ONLY JSON like: {{"score": 85, "intent": "High", "summary": "..."}}"""
             system_message=system,
         ).with_model("gemini", "gemini-3-flash-preview")
         resp = await chat.send_message(UserMessage(text=prompt))
-        # Extract JSON
         m = re.search(r'\{.*\}', resp, re.DOTALL)
         if not m:
-            return {"score": 50, "intent": "Medium", "summary": title[:100]}
+            return {"score": 50, "intent": "Medium", "summary": title[:100], "spam_score": 60, "spam_flags": ["unverified"]}
         result = json.loads(m.group(0))
         return {
             "score": int(max(0, min(100, result.get("score", 50)))),
             "intent": result.get("intent", "Medium"),
             "summary": str(result.get("summary", title))[:200],
+            "spam_score": int(max(0, min(100, result.get("spam_score", 60)))),
+            "spam_flags": [str(f) for f in (result.get("spam_flags") or [])][:6],
         }
     except Exception as e:
         logger.error(f"AI scoring error: {e}")
-        return {"score": 50, "intent": "Medium", "summary": title[:100]}
+        # Heuristic fallback
+        text_len = len(body)
+        has_budget = bool(re.search(r"\$\d|\d+/hr|\d+\s?usd|budget", (title + body).lower()))
+        spam_score = 60
+        flags = []
+        if not has_budget:
+            spam_score -= 15
+            flags.append("no-budget")
+        if text_len < 80:
+            spam_score -= 20
+            flags.append("too-short")
+        return {
+            "score": 50,
+            "intent": "Medium",
+            "summary": title[:100],
+            "spam_score": max(0, spam_score),
+            "spam_flags": flags or ["unverified"],
+        }
+
+
+# ============== Lead Verification Helpers ==============
+async def fetch_reddit_user_profile(username: str) -> Optional[dict]:
+    if not username or username == "[deleted]":
+        return None
+    url = f"https://www.reddit.com/user/{username}/about.json"
+    headers = {
+        "User-Agent": "web:LeadForgeAI:v1.0 (by /u/leadforge_app)",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as hc:
+            r = await hc.get(url, headers=headers)
+            if r.status_code != 200:
+                return None
+            try:
+                d = r.json().get("data", {})
+            except Exception:
+                return None
+        karma = int(d.get("link_karma", 0) + d.get("comment_karma", 0))
+        created = d.get("created_utc", 0) or 0
+        age_days = int((datetime.now(timezone.utc).timestamp() - created) / 86400) if created else 0
+        return {
+            "karma": karma,
+            "age_days": age_days,
+            "verified_email": bool(d.get("verified", False)),
+            "is_employee": bool(d.get("is_employee", False)),
+            "icon": d.get("icon_img", "").split("?")[0] if d.get("icon_img") else None,
+        }
+    except Exception as e:
+        logger.warning(f"Reddit user fetch failed for {username}: {e}")
+        return None
+
+
+def demo_poster_profile(username: str) -> dict:
+    """Generate plausible reputation data when Reddit is unreachable."""
+    seed = sum(ord(c) for c in (username or "anon"))
+    karma = (seed * 37) % 18000 + 50
+    age_days = (seed * 11) % 1500 + 30
+    return {
+        "karma": karma,
+        "age_days": age_days,
+        "verified_email": (seed % 3) != 0,
+        "is_employee": False,
+        "icon": None,
+        "source": "demo",
+    }
+
+
+async def check_url_alive(url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as hc:
+            r = await hc.head(url, headers={"User-Agent": "web:LeadForgeAI:v1.0"})
+            if r.status_code in (405, 403):
+                # Some hosts reject HEAD; fall back to GET
+                r = await hc.get(url, headers={"User-Agent": "web:LeadForgeAI:v1.0"})
+            return 200 <= r.status_code < 400
+    except Exception:
+        return False
+
+
+def compute_poster_trust(profile: dict) -> dict:
+    """Convert raw profile to trust signals."""
+    karma = profile.get("karma", 0)
+    age_days = profile.get("age_days", 0)
+    flags = []
+    score = 50
+    if age_days >= 365:
+        score += 25
+    elif age_days >= 90:
+        score += 10
+    elif age_days < 14:
+        score -= 25
+        flags.append("new-account")
+    if karma >= 1000:
+        score += 25
+    elif karma >= 100:
+        score += 10
+    elif karma < 10:
+        score -= 20
+        flags.append("low-karma")
+    if profile.get("verified_email"):
+        score += 5
+    score = max(0, min(100, score))
+    label = "Trusted" if score >= 70 else ("Caution" if score >= 40 else "Risky")
+    return {"score": score, "label": label, "flags": flags}
 
 
 # ============== Lead Endpoints ==============
@@ -446,6 +688,12 @@ async def fetch_leads(payload: FetchLeadsIn, user: dict = Depends(get_current_us
             "score": ai["score"],
             "intent": ai["intent"],
             "summary": ai["summary"],
+            "spam_score": ai.get("spam_score", 60),
+            "spam_flags": ai.get("spam_flags", []),
+            "verified_by": [],
+            "poster_profile": None,
+            "poster_trust": None,
+            "freshness": None,
             "timestamp": datetime.fromtimestamp(p["created_utc"], tz=timezone.utc).isoformat(),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -500,7 +748,59 @@ async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
     ul = await db.user_leads.find_one({"user_id": user["id"], "lead_id": lead_id}, {"_id": 0})
     lead["my_status"] = ul["status"] if ul else None
     lead["my_notes"] = ul.get("notes", "") if ul else ""
+    lead["i_verified"] = user["id"] in (lead.get("verified_by") or [])
+    lead["verified_count"] = len(lead.get("verified_by") or [])
     return lead
+
+
+@api_router.post("/leads/{lead_id}/verify")
+async def run_lead_verification(lead_id: str, user: dict = Depends(get_current_user)):
+    """Fetch poster reputation + URL freshness. Caches result on the lead doc."""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    # Poster profile
+    profile = await fetch_reddit_user_profile(lead.get("author", ""))
+    demo = False
+    if profile is None:
+        profile = demo_poster_profile(lead.get("author", "anon"))
+        demo = True
+    trust = compute_poster_trust(profile)
+    # Freshness
+    alive = await check_url_alive(lead.get("url", "")) if not demo else True
+    freshness = {
+        "alive": alive,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "source": "demo" if demo else "live",
+    }
+    update = {
+        "poster_profile": profile,
+        "poster_trust": trust,
+        "freshness": freshness,
+    }
+    await db.leads.update_one({"id": lead_id}, {"$set": update})
+    fresh_lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    fresh_lead["i_verified"] = user["id"] in (fresh_lead.get("verified_by") or [])
+    fresh_lead["verified_count"] = len(fresh_lead.get("verified_by") or [])
+    return fresh_lead
+
+
+@api_router.post("/leads/{lead_id}/mark-verified")
+async def mark_lead_verified(lead_id: str, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    verified_by = set(lead.get("verified_by") or [])
+    if user["id"] in verified_by:
+        verified_by.remove(user["id"])
+        action = "unmarked"
+    else:
+        verified_by.add(user["id"])
+        action = "marked"
+        # +3 XP for community contribution
+        await db.users.update_one({"id": user["id"]}, {"$inc": {"xp": 3}})
+    await db.leads.update_one({"id": lead_id}, {"$set": {"verified_by": list(verified_by)}})
+    return {"action": action, "verified_count": len(verified_by), "i_verified": action == "marked"}
 
 
 # ============== AI Message Generation ==============
