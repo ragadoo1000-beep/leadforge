@@ -115,4 +115,12 @@ export const api = {
   // Compliance
   getPolicy: () => request("/policy"),
   deleteAccount: () => request("/account", { method: "DELETE" }),
+
+  // Analytics (internal, user-scoped only)
+  trackEvent: (name: string, meta?: any) =>
+    request("/events/track", {
+      method: "POST",
+      body: JSON.stringify({ name, meta: meta || {} }),
+    }).catch(() => null), // never fail user flow on analytics error
+  eventSummary: () => request("/events/summary"),
 };

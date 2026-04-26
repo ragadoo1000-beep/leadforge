@@ -68,6 +68,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await api.login({ email, password });
     await setToken(res.token);
     setUser(res.user);
+    api.trackEvent("login");
     try {
       await api.checkIn();
     } catch {}
@@ -76,6 +77,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const loginWithToken = async (token: string, userObj: User) => {
     await setToken(token);
     setUser(userObj);
+    api.trackEvent("login", { provider: "social" });
     try {
       await api.checkIn();
     } catch {}
@@ -85,6 +87,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await api.register({ email, password, name });
     await setToken(res.token);
     setUser(res.user);
+    api.trackEvent("signup");
     try {
       await api.checkIn();
     } catch {}

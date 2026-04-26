@@ -54,6 +54,7 @@ export default function MessageScreen() {
   const copy = async () => {
     const text = activeTab === "reddit" ? reddit : email;
     await Clipboard.setStringAsync(text);
+    api.trackEvent("message_copied", { channel: activeTab });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     Alert.alert("Copied", "Message copied to clipboard.");
   };

@@ -126,6 +126,15 @@ export default function RegisterScreen() {
               </TouchableOpacity>
             </Link>
           </View>
+
+          <View style={{ height: space.md }} />
+          <Link href="/compliance" asChild>
+            <TouchableOpacity testID="footer-compliance-link">
+              <Text style={styles.legalLink}>
+                By creating an account you agree to our Terms · Privacy · Disclaimer
+              </Text>
+            </TouchableOpacity>
+          </Link>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -163,4 +172,5 @@ const styles = StyleSheet.create({
   footerRow: { flexDirection: "row", justifyContent: "center" },
   footerText: { color: colors.textSecondary, fontFamily: fonts.body },
   footerLink: { color: colors.primary, fontFamily: fonts.bodySemi },
+  legalLink: { color: colors.textTertiary, fontFamily: fonts.body, fontSize: 11, textAlign: "center", textDecorationLine: "underline" },
 });
