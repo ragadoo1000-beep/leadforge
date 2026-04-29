@@ -1,27 +1,23 @@
 {
   "expo": {
-    "name": "frontend",
-    "slug": "frontend",
+    "name": "LeadForge AI",
+    "slug": "leadforge-ai",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "frontend",
+    "scheme": "leadforge",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
-    "ios": {
-      "supportsTablet": true
-    },
-    "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#000"
-      },
-      "edgeToEdgeEnabled": true
-    },
     "web": {
       "bundler": "metro",
       "output": "static",
-      "favicon": "./assets/images/favicon.png"
+      "favicon": "./assets/images/favicon.png",
+      "name": "LeadForge AI — Get freelance clients from Reddit",
+      "shortName": "LeadForge AI",
+      "description": "LeadForge AI finds real client opportunities on Reddit and helps you write personalized outreach messages in seconds. No automation. You stay in control.",
+      "themeColor": "#0A0A0F",
+      "backgroundColor": "#0A0A0F",
+      "lang": "en"
     },
     "plugins": [
       "expo-router",
@@ -31,7 +27,7 @@
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#000"
+          "backgroundColor": "#0A0A0F"
         }
       ],
       "expo-web-browser"
