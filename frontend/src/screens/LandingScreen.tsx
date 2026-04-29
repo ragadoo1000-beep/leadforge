@@ -580,7 +580,7 @@ export default function LandingScreen() {
               <View style={[s.selectWrap, { flex: width < 720 ? undefined : 1 }]}>
                 <Pressable
                   style={s.selectBtn}
-                  onPress={() => setShowRoleMenu((v) => !v)}
+                  onPress={() => setShowRoleMenu(true)}
                   testID="early-access-role"
                 >
                   <Ionicons name="briefcase-outline" size={16} color={C.textMuted} />
@@ -588,33 +588,11 @@ export default function LandingScreen() {
                     {role || "What do you do?"}
                   </Text>
                   <Ionicons
-                    name={showRoleMenu ? "chevron-up" : "chevron-down"}
+                    name="chevron-down"
                     size={16}
                     color={C.textMuted}
                   />
                 </Pressable>
-                {showRoleMenu && (
-                  <View style={s.selectMenu}>
-                    {ROLES.map((r) => (
-                      <Pressable
-                        key={r}
-                        style={({ hovered }: any) => [
-                          s.selectItem,
-                          hovered ? { backgroundColor: C.surfaceHi } : null,
-                        ]}
-                        onPress={() => {
-                          setRole(r);
-                          setShowRoleMenu(false);
-                        }}
-                      >
-                        <Text style={s.selectItemText}>{r}</Text>
-                        {role === r ? (
-                          <Ionicons name="checkmark" size={14} color={C.primary} />
-                        ) : null}
-                      </Pressable>
-                    ))}
-                  </View>
-                )}
               </View>
 
               <HoverPress
@@ -700,6 +678,17 @@ export default function LandingScreen() {
         legalKey={legalKey}
         onClose={() => setLegalKey(null)}
         isDesktop={isDesktop}
+      />
+
+      {/* ============== Role Picker Modal ============== */}
+      <RolePickerModal
+        visible={showRoleMenu}
+        selected={role}
+        onSelect={(r) => {
+          setRole(r);
+          setShowRoleMenu(false);
+        }}
+        onClose={() => setShowRoleMenu(false)}
       />
     </ScrollView>
   );
@@ -788,6 +777,61 @@ function LegalModal({
     </Modal>
   );
 }
+
+// ===== Role Picker Modal — bottom-sheet style, reliable on mobile + desktop =====
+function RolePickerModal({
+  visible,
+  selected,
+  onSelect,
+  onClose,
+}: {
+  visible: boolean;
+  selected: string;
+  onSelect: (r: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <Pressable style={legal.scrim} onPress={onClose} />
+      <View style={legal.center} pointerEvents="box-none">
+        <View style={[role.card, { maxHeight: "70%" as any }]}>
+          <View style={role.head}>
+            <Text style={role.title}>What do you do?</Text>
+            <Pressable onPress={onClose} hitSlop={10} style={legal.close}>
+              <Ionicons name="close" size={18} color={C.textMuted} />
+            </Pressable>
+          </View>
+          <ScrollView style={{ maxHeight: 360 }} showsVerticalScrollIndicator={false}>
+            {ROLES.map((r) => {
+              const isSelected = selected === r;
+              return (
+                <Pressable
+                  key={r}
+                  onPress={() => onSelect(r)}
+                  style={({ hovered, pressed }: any) => [
+                    role.item,
+                    hovered ? { backgroundColor: C.surfaceHi } : null,
+                    pressed ? { opacity: 0.85 } : null,
+                  ]}
+                >
+                  <Text style={[role.itemText, isSelected ? { color: C.primary } : null]}>{r}</Text>
+                  {isSelected ? (
+                    <View style={role.checkPill}>
+                      <Ionicons name="checkmark" size={14} color="#fff" />
+                    </View>
+                  ) : (
+                    <View style={role.checkEmpty} />
+                  )}
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 
 // ===== Step Card =====
 function StepCard({ index, step }: { index: number; step: { icon: any; title: string; desc: string } }) {
@@ -1645,3 +1689,66 @@ const legal = StyleSheet.create({
     paddingBottom: 8,
   },
 });
+
+// ===== Role picker modal styles =====
+const role = StyleSheet.create({
+  card: {
+    backgroundColor: C.surface,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: C.border,
+    width: 420,
+    maxWidth: "92%",
+    overflow: "hidden",
+    shadowColor: "#000",
+    shadowOpacity: 0.5,
+    shadowRadius: 30,
+    shadowOffset: { width: 0, height: 14 },
+  },
+  head: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 22,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+  },
+  title: {
+    fontFamily: FONT.heading,
+    color: C.text,
+    fontSize: 18,
+    letterSpacing: -0.2,
+  },
+  item: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 22,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+    ...(Platform.OS === "web" ? ({ cursor: "pointer", transition: "background-color 140ms ease" } as any) : {}),
+  },
+  itemText: {
+    fontFamily: FONT.bodySemi,
+    color: C.text,
+    fontSize: 15,
+  },
+  checkPill: {
+    width: 22,
+    height: 22,
+    borderRadius: 22,
+    backgroundColor: C.primary,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  checkEmpty: {
+    width: 22,
+    height: 22,
+    borderRadius: 22,
+    borderWidth: 1.5,
+    borderColor: C.border,
+  },
+});
+

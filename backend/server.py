@@ -18,7 +18,7 @@ import razorpay
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -1289,9 +1289,45 @@ class EarlyAccessIn(BaseModel):
     company: Optional[str] = Field(default=None, max_length=200)
 
 
+# Webhook URL is loaded once on import (set in /app/backend/.env). Empty = disabled.
+EARLY_ACCESS_WEBHOOK_URL = os.environ.get("EARLY_ACCESS_WEBHOOK_URL", "").strip()
+EARLY_ACCESS_WEBHOOK_SECRET = os.environ.get("EARLY_ACCESS_WEBHOOK_SECRET", "").strip()
+
+
+async def _post_early_access_webhook(payload: dict, masked_email: str) -> None:
+    """Fire-and-forget webhook to Zapier/Make/Sheets. Never raises to caller.
+
+    Sends email/role/source/created_at as JSON. Optional shared-secret header so
+    the receiving end can verify it's really us.
+    """
+    url = EARLY_ACCESS_WEBHOOK_URL
+    if not url:
+        return
+    headers = {"Content-Type": "application/json", "User-Agent": "LeadForgeAI-Webhook/1.0"}
+    if EARLY_ACCESS_WEBHOOK_SECRET:
+        headers["X-LeadForge-Signature"] = EARLY_ACCESS_WEBHOOK_SECRET
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as cx:
+            resp = await cx.post(url, json=payload, headers=headers)
+        if resp.status_code >= 400:
+            logger.warning(
+                "WEBHOOK delivery non-2xx email=%s status=%s",
+                masked_email, resp.status_code,
+            )
+        else:
+            logger.info("WEBHOOK delivered email=%s status=%s", masked_email, resp.status_code)
+    except Exception as e:
+        # Never block or fail the user — webhooks are best-effort.
+        logger.warning("WEBHOOK failed email=%s err=%s", masked_email, type(e).__name__)
+
+
 @api_router.post("/early-access/signup")
 @limiter.limit("5/minute")
-async def early_access_signup(request: Request, payload: EarlyAccessIn):
+async def early_access_signup(
+    request: Request,
+    payload: EarlyAccessIn,
+    background: BackgroundTasks,
+):
     """Public — capture early access signups from the marketing landing page."""
     masked = mask_email(payload.email)
     ip_hash = hashlib.sha256(_client_ip(request).encode()).hexdigest()[:8]
@@ -1314,6 +1350,8 @@ async def early_access_signup(request: Request, payload: EarlyAccessIn):
         logger.info("SIGNUP duplicate email=%s ip=%s source=%s", masked, ip_hash, source)
         return {"ok": True, "already_registered": True}
 
+    created_at = datetime.now(timezone.utc).isoformat()
+
     try:
         await db.early_access.insert_one({
             "id": str(uuid.uuid4()),
@@ -1321,14 +1359,25 @@ async def early_access_signup(request: Request, payload: EarlyAccessIn):
             "role": role,
             "source": source,
             "ip_hash": hashlib.sha256(_client_ip(request).encode()).hexdigest()[:16],
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": created_at,
         })
     except Exception as e:
-        # Race-condition safety: another concurrent insert won the unique index.
         logger.warning("SIGNUP insert race email=%s ip=%s err=%s", masked, ip_hash, type(e).__name__)
         return {"ok": True, "already_registered": True}
 
     logger.info("SIGNUP accepted email=%s ip=%s source=%s role=%s", masked, ip_hash, source, role or "-")
+
+    # Fire-and-forget webhook to Zapier/Make/Sheets. Runs AFTER response is sent
+    # to the user, so a slow webhook never delays the form-success UI.
+    if EARLY_ACCESS_WEBHOOK_URL:
+        webhook_payload = {
+            "email": email,
+            "role": role,
+            "source": source,
+            "created_at": created_at,
+        }
+        background.add_task(_post_early_access_webhook, webhook_payload, masked)
+
     return {"ok": True, "already_registered": False}
 
 
