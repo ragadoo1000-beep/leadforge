@@ -11,7 +11,7 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://ai-outreach-17.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://leadforge-ai-4.preview.emergentagent.com").rstrip("/")
 API = f"{BASE_URL}/api"
 
 # ----- Module-level fixtures -----

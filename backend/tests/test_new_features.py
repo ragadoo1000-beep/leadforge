@@ -4,7 +4,7 @@ import uuid
 import pytest
 import requests
 
-BASE = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://ai-outreach-17.preview.emergentagent.com").rstrip("/")
+BASE = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://leadforge-ai-4.preview.emergentagent.com").rstrip("/")
 API = f"{BASE}/api"
 
 EXISTING_EMAIL = "test@leadforge.io"

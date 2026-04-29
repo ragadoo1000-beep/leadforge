@@ -1131,6 +1131,41 @@ async def get_policy():
     return POLICY_DOC
 
 
+# ============== Early Access (Public Landing) ==============
+class EarlyAccessIn(BaseModel):
+    email: EmailStr
+    role: Optional[str] = None
+    source: Optional[str] = None
+
+
+@api_router.post("/early-access/signup")
+async def early_access_signup(payload: EarlyAccessIn):
+    """Public — capture early access signups from the marketing landing page."""
+    email = payload.email.lower().strip()
+    role = (payload.role or "").strip()[:40] if payload.role else None
+    source = (payload.source or "landing").strip()[:40]
+
+    existing = await db.early_access.find_one({"email": email})
+    if existing:
+        return {"ok": True, "already_registered": True}
+
+    await db.early_access.insert_one({
+        "id": str(uuid.uuid4()),
+        "email": email,
+        "role": role,
+        "source": source,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"ok": True, "already_registered": False}
+
+
+@api_router.get("/early-access/count")
+async def early_access_count():
+    """Public — show a count of early access signups for social proof."""
+    n = await db.early_access.count_documents({})
+    return {"count": n}
+
+
 @api_router.delete("/account")
 async def delete_account(user: dict = Depends(get_current_user)):
     """Hard-delete the user and all data they own. Cannot be undone."""
@@ -1175,11 +1210,13 @@ async def track_event(payload: TrackEventIn, user: dict = Depends(get_current_us
     """Internal-only event tracking. Stores event name, user_id, ts. No PII or message content."""
     if payload.name not in ALLOWED_EVENTS:
         raise HTTPException(status_code=400, detail="Unknown event")
-    # Strip any keys that look like PII from meta
+    # Strip any keys that look like PII from meta (substring match, case-insensitive)
+    PII_TOKENS = ("email", "phone", "address", "card", "password", "name", "ssn", "tax", "dob", "ip")
     safe_meta = {}
     if payload.meta:
         for k, v in payload.meta.items():
-            if k.lower() in {"email", "phone", "address", "card", "password", "name"}:
+            kl = k.lower()
+            if any(token in kl for token in PII_TOKENS):
                 continue
             if isinstance(v, (str, int, float, bool)) and len(str(v)) < 200:
                 safe_meta[k] = v

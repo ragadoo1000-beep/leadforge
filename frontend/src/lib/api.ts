@@ -123,4 +123,12 @@ export const api = {
       body: JSON.stringify({ name, meta: meta || {} }),
     }).catch(() => null), // never fail user flow on analytics error
   eventSummary: () => request("/events/summary"),
+
+  // Public — early access (landing page)
+  earlyAccessSignup: (body: { email: string; role?: string; source?: string }) =>
+    request("/early-access/signup", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  earlyAccessCount: () => request("/early-access/count"),
 };
