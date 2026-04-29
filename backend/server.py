@@ -81,14 +81,27 @@ async def rate_limit_handler(request: StarletteRequest, exc: RateLimitExceeded):
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: StarletteRequest, call_next):
         response: Response = await call_next(request)
-        # Generic, API-safe headers (front-end is on a different host but we still set safe defaults)
+        # Generic, web-safe headers — strict but won't block a normal landing page UI.
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        # API responses are JSON only — lock down all script/object/frame ancestors.
+        # CSP: allow self + https assets so the landing page (and its fonts/images) renders cleanly.
+        # We still lock framing, base URI, plugins, and forms — the parts that matter for clickjacking
+        # and content-injection attacks. 'unsafe-inline' on style is needed for React Native Web's
+        # inline styles; 'unsafe-inline' on script is needed for Expo Router's hydration shim.
         response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https:; "
+            "img-src 'self' data: blob: https:; "
+            "font-src 'self' data: https://fonts.gstatic.com https:; "
+            "connect-src 'self' https:; "
+            "media-src 'self' https: data:; "
+            "object-src 'none'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'"
         )
         # Long-lived HTTPS lock (Emergent ingress is HTTPS).
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
@@ -122,6 +135,62 @@ def sanitize_str(value: Optional[str], max_len: int = 200) -> Optional[str]:
     if len(cleaned) > max_len:
         cleaned = cleaned[:max_len]
     return cleaned
+
+
+# ============== PII-safe Logging Helpers ==============
+def mask_email(email: Optional[str]) -> str:
+    """Return a privacy-safe representation of an email for logs.
+    foo@example.com  -> f**@example.com
+    ab@example.com   -> a*@example.com
+    Single-char or invalid input collapses to '***'.
+    """
+    if not email or "@" not in email:
+        return "***"
+    try:
+        local, domain = email.split("@", 1)
+        local = local.strip()
+        if len(local) <= 1:
+            return "***"
+        return f"{local[0]}{'*' * max(1, len(local) - 1)}@{domain}"
+    except Exception:
+        return "***"
+
+
+# ============== Access / Request Logging ==============
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    """Lightweight per-request logger for /api/* — server-side only, no payloads, no PII.
+
+    Format:  ACCESS METHOD PATH -> STATUS in DURATIONms (ip=HASH)
+    The IP is hashed (truncated SHA256) so we can correlate suspicious patterns without
+    storing raw client IPs in logs.
+    """
+
+    async def dispatch(self, request: StarletteRequest, call_next):
+        if not request.url.path.startswith("/api/"):
+            return await call_next(request)
+        start = datetime.now(timezone.utc)
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+        except Exception:
+            # Re-raise so the global exception handler runs; but still log the failure.
+            duration_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+            ip_hash = hashlib.sha256(_client_ip(request).encode()).hexdigest()[:8]
+            logger.exception(
+                "ACCESS %s %s -> 500 in %sms (ip=%s)",
+                request.method, request.url.path, duration_ms, ip_hash,
+            )
+            raise
+        duration_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+        ip_hash = hashlib.sha256(_client_ip(request).encode()).hexdigest()[:8]
+        # Use WARNING for 4xx/5xx so they stand out in log scans; INFO for 2xx/3xx.
+        level = logging.WARNING if status_code >= 400 else logging.INFO
+        logger.log(
+            level,
+            "ACCESS %s %s -> %s in %sms (ip=%s)",
+            request.method, request.url.path, status_code, duration_ms, ip_hash,
+        )
+        return response
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -1224,14 +1293,17 @@ class EarlyAccessIn(BaseModel):
 @limiter.limit("5/minute")
 async def early_access_signup(request: Request, payload: EarlyAccessIn):
     """Public — capture early access signups from the marketing landing page."""
+    masked = mask_email(payload.email)
+    ip_hash = hashlib.sha256(_client_ip(request).encode()).hexdigest()[:8]
+
     # Honeypot: silently accept (so bots don't learn) but never store the record.
     if payload.company and payload.company.strip():
-        logger.info("Early-access honeypot tripped from %s", _client_ip(request))
+        logger.warning("SIGNUP honeypot tripped email=%s ip=%s", masked, ip_hash)
         return {"ok": True, "already_registered": False}
 
     email = payload.email.lower().strip()
-    # Defensive cap: EmailStr already validates format, but cap length to be safe in storage.
     if len(email) > 254:
+        logger.warning("SIGNUP rejected reason=email_too_long ip=%s", ip_hash)
         raise HTTPException(status_code=400, detail="Invalid email")
 
     role = sanitize_str(payload.role, max_len=40)
@@ -1239,16 +1311,24 @@ async def early_access_signup(request: Request, payload: EarlyAccessIn):
 
     existing = await db.early_access.find_one({"email": email})
     if existing:
+        logger.info("SIGNUP duplicate email=%s ip=%s source=%s", masked, ip_hash, source)
         return {"ok": True, "already_registered": True}
 
-    await db.early_access.insert_one({
-        "id": str(uuid.uuid4()),
-        "email": email,
-        "role": role,
-        "source": source,
-        "ip_hash": hashlib.sha256(_client_ip(request).encode()).hexdigest()[:16],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    try:
+        await db.early_access.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": email,
+            "role": role,
+            "source": source,
+            "ip_hash": hashlib.sha256(_client_ip(request).encode()).hexdigest()[:16],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        # Race-condition safety: another concurrent insert won the unique index.
+        logger.warning("SIGNUP insert race email=%s ip=%s err=%s", masked, ip_hash, type(e).__name__)
+        return {"ok": True, "already_registered": True}
+
+    logger.info("SIGNUP accepted email=%s ip=%s source=%s role=%s", masked, ip_hash, source, role or "-")
     return {"ok": True, "already_registered": False}
 
 
@@ -1660,6 +1740,9 @@ app.add_middleware(
 
 # Order matters: security headers should run last (i.e., wrap the response from inner middleware/routes).
 app.add_middleware(SecurityHeadersMiddleware)
+
+# Access log runs first so it can time the full request including downstream middleware.
+app.add_middleware(AccessLogMiddleware)
 
 
 @app.on_event("startup")
