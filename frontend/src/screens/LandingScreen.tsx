@@ -11,10 +11,10 @@ import {
   Linking,
   Animated,
   Easing,
+  Modal,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
 import { api } from "../lib/api";
 
 // ===== Landing-specific dark palette (locked, independent from app theme) =====
@@ -247,7 +247,6 @@ export default function LandingScreen() {
   const { width } = useWindowDimensions();
   const isDesktop = width >= 980;
   const isTablet = width >= 720 && width < 980;
-  const router = useRouter();
 
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<string>("");
@@ -256,6 +255,7 @@ export default function LandingScreen() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [showRoleMenu, setShowRoleMenu] = useState(false);
   const [count, setCount] = useState<number | null>(null);
+  const [legalKey, setLegalKey] = useState<null | "privacy" | "terms" | "disclaimer">(null);
 
   const heroEmailRef = useRef<TextInput>(null);
   const ctaSectionRef = useRef<View>(null);
@@ -344,9 +344,6 @@ export default function LandingScreen() {
           )}
 
           <View style={s.navCtas}>
-            <Pressable onPress={() => router.push("/login")}>
-              <Text style={s.navLink}>Sign in</Text>
-            </Pressable>
             <HoverPress onPress={() => scrollToSection("cta")} style={s.navCta}>
               <Text style={s.navCtaText}>Get early access</Text>
             </HoverPress>
@@ -641,13 +638,13 @@ export default function LandingScreen() {
           </View>
 
           <View style={s.footerLinks}>
-            <Pressable onPress={() => router.push("/compliance")}>
+            <Pressable onPress={() => setLegalKey("privacy")}>
               <Text style={s.footerLink}>Privacy Policy</Text>
             </Pressable>
-            <Pressable onPress={() => router.push("/compliance")}>
+            <Pressable onPress={() => setLegalKey("terms")}>
               <Text style={s.footerLink}>Terms</Text>
             </Pressable>
-            <Pressable onPress={() => router.push("/compliance")}>
+            <Pressable onPress={() => setLegalKey("disclaimer")}>
               <Text style={s.footerLink}>Disclaimer</Text>
             </Pressable>
             <Pressable onPress={() => Linking.openURL("mailto:hello@leadforge.app")}>
@@ -661,7 +658,98 @@ export default function LandingScreen() {
         </Text>
         <Text style={s.footerCopy}>© {new Date().getFullYear()} LeadForge AI. Built for freelancers.</Text>
       </View>
+
+      {/* ============== Legal Modal ============== */}
+      <LegalModal
+        legalKey={legalKey}
+        onClose={() => setLegalKey(null)}
+        isDesktop={isDesktop}
+      />
     </ScrollView>
+  );
+}
+
+// ===== Legal Modal =====
+const LEGAL_CONTENT: Record<string, { title: string; body: string }> = {
+  privacy: {
+    title: "Privacy Policy",
+    body:
+`We collect the bare minimum needed to deliver LeadForge AI:
+• Your email address (only used to send you product updates and access notifications).
+• Optional role you select (Designer, Developer, Marketer, or Other) so we can prioritize features.
+
+We do not:
+• Sell your data to third parties.
+• Use third-party advertising trackers.
+• Store any private message content you generate.
+
+You can request deletion of your data at any time by emailing hello@leadforge.app. We will remove your record within 30 days.
+
+Last updated: April 2026.`,
+  },
+  terms: {
+    title: "Terms of Service",
+    body:
+`By joining the LeadForge AI early access list you acknowledge:
+• Early access is offered as-is, with no uptime or feature guarantees during beta.
+• You will use LeadForge AI to identify hiring opportunities you found through publicly available content.
+• You will not use LeadForge AI to send unsolicited bulk messages, spam, or to violate the terms of service of any platform (including Reddit).
+• You remain solely responsible for every outreach message you send. LeadForge AI does not auto-send messages on your behalf.
+• We may update or discontinue features at any time during the beta period.
+
+Last updated: April 2026.`,
+  },
+  disclaimer: {
+    title: "Disclaimer",
+    body:
+`LeadForge AI is an independent product. We are not affiliated with, endorsed by, or sponsored by Reddit, Inc. or any subreddit moderation team.
+
+Results vary. Signing up for early access does not guarantee that you will land clients, win projects, or generate any specific level of income. Outcomes depend on your skills, market fit, and the effort you put into your outreach.
+
+The AI scoring is a heuristic and may surface false positives. Always review every lead and message before sending.
+
+Last updated: April 2026.`,
+  },
+};
+
+function LegalModal({
+  legalKey,
+  onClose,
+  isDesktop,
+}: {
+  legalKey: null | "privacy" | "terms" | "disclaimer";
+  onClose: () => void;
+  isDesktop: boolean;
+}) {
+  const visible = !!legalKey;
+  const data = legalKey ? LEGAL_CONTENT[legalKey] : null;
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="fade"
+      onRequestClose={onClose}
+    >
+      <Pressable style={legal.scrim} onPress={onClose} />
+      <View style={legal.center} pointerEvents="box-none">
+        <View
+          style={[
+            legal.card,
+            { width: isDesktop ? 640 : "92%", maxWidth: 640, maxHeight: "82%" as any },
+          ]}
+        >
+          <View style={legal.head}>
+            <Text style={legal.title}>{data?.title}</Text>
+            <Pressable onPress={onClose} hitSlop={10} style={legal.close}>
+              <Ionicons name="close" size={18} color={C.textMuted} />
+            </Pressable>
+          </View>
+          <ScrollView style={{ paddingHorizontal: 24, paddingBottom: 24 }}>
+            <Text style={legal.body}>{data?.body}</Text>
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -1444,4 +1532,63 @@ const mockup = StyleSheet.create({
   miniBody: { fontFamily: FONT.body, color: C.text, fontSize: 12, lineHeight: 18 },
   copyRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 12 },
   copyText: { fontFamily: FONT.bodyMid, color: C.textMuted, fontSize: 11 },
+});
+
+
+// ===== Legal modal styles =====
+const legal = StyleSheet.create({
+  scrim: {
+    ...(StyleSheet.absoluteFillObject as any),
+    backgroundColor: "rgba(0,0,0,0.6)",
+  },
+  center: {
+    ...(StyleSheet.absoluteFillObject as any),
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 16,
+  },
+  card: {
+    backgroundColor: C.surface,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: C.border,
+    overflow: "hidden",
+    shadowColor: "#000",
+    shadowOpacity: 0.5,
+    shadowRadius: 30,
+    shadowOffset: { width: 0, height: 14 },
+  },
+  head: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 24,
+    paddingVertical: 18,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+  },
+  title: {
+    fontFamily: FONT.heading,
+    color: C.text,
+    fontSize: 20,
+    letterSpacing: -0.3,
+  },
+  close: {
+    width: 32,
+    height: 32,
+    borderRadius: 32,
+    backgroundColor: C.surfaceHi,
+    borderWidth: 1,
+    borderColor: C.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  body: {
+    fontFamily: FONT.body,
+    color: C.textMuted,
+    fontSize: 14,
+    lineHeight: 24,
+    paddingTop: 18,
+    paddingBottom: 8,
+  },
 });
