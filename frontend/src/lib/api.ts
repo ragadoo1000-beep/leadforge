@@ -125,7 +125,7 @@ export const api = {
   eventSummary: () => request("/events/summary"),
 
   // Public — early access (landing page)
-  earlyAccessSignup: (body: { email: string; role?: string; source?: string }) =>
+  earlyAccessSignup: (body: { email: string; role?: string; source?: string; company?: string }) =>
     request("/early-access/signup", {
       method: "POST",
       body: JSON.stringify(body),

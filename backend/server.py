@@ -26,6 +26,13 @@ from pydantic import BaseModel, Field, EmailStr
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+
 # ============== Setup ==============
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
@@ -41,9 +48,80 @@ RAZORPAY_WEBHOOK_SECRET = os.environ.get('RAZORPAY_WEBHOOK_SECRET', '').strip()
 RAZORPAY_ENABLED = bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_ENABLED else None
 
-app = FastAPI(title="LeadForge AI API")
+app = FastAPI(title="LeadForge AI API", docs_url=None, redoc_url=None, openapi_url=None)
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer(auto_error=False)
+
+
+# ============== Rate Limiting ==============
+def _client_ip(request: StarletteRequest) -> str:
+    """Extract client IP, honoring common proxy headers (Emergent ingress)."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_client_ip, default_limits=["120/minute"])
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: StarletteRequest, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many requests. Please slow down and try again in a moment."},
+    )
+
+
+# ============== Security Headers ==============
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response: Response = await call_next(request)
+        # Generic, API-safe headers (front-end is on a different host but we still set safe defaults)
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        # API responses are JSON only — lock down all script/object/frame ancestors.
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+        )
+        # Long-lived HTTPS lock (Emergent ingress is HTTPS).
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+
+# ============== Generic Error Handler ==============
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: StarletteRequest, exc: Exception):
+    """Log internal error server-side; never leak the stack trace to clients."""
+    logger_safe = logging.getLogger(__name__)
+    logger_safe.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong. Please try again."},
+    )
+
+
+# ============== Input Sanitization ==============
+_CTRL_CHARS = "".join(map(chr, list(range(0, 32)) + [127]))
+_CTRL_TABLE = str.maketrans({c: None for c in _CTRL_CHARS if c not in "\n\t"})
+
+
+def sanitize_str(value: Optional[str], max_len: int = 200) -> Optional[str]:
+    """Strip control chars, trim, cap length. Use for any user-supplied free text."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    cleaned = value.translate(_CTRL_TABLE).strip()
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -138,7 +216,8 @@ class InvoiceIn(BaseModel):
 
 # ============== Auth Endpoints ==============
 @api_router.post("/auth/register")
-async def register(payload: RegisterIn):
+@limiter.limit("10/minute")
+async def register(request: Request, payload: RegisterIn):
     email = payload.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -146,7 +225,7 @@ async def register(payload: RegisterIn):
     user_doc = {
         "id": user_id,
         "email": email,
-        "name": payload.name,
+        "name": sanitize_str(payload.name, max_len=80) or "",
         "password_hash": hash_password(payload.password),
         "profession": "",
         "skills": [],
@@ -172,7 +251,8 @@ async def register(payload: RegisterIn):
 
 
 @api_router.post("/auth/login")
-async def login(payload: LoginIn):
+@limiter.limit("10/minute")
+async def login(request: Request, payload: LoginIn):
     email = payload.email.lower()
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user["password_hash"]):
@@ -1134,16 +1214,28 @@ async def get_policy():
 # ============== Early Access (Public Landing) ==============
 class EarlyAccessIn(BaseModel):
     email: EmailStr
-    role: Optional[str] = None
-    source: Optional[str] = None
+    role: Optional[str] = Field(default=None, max_length=40)
+    source: Optional[str] = Field(default=None, max_length=40)
+    # Honeypot field — must remain empty. Bots that auto-fill all inputs will trip this.
+    company: Optional[str] = Field(default=None, max_length=200)
 
 
 @api_router.post("/early-access/signup")
-async def early_access_signup(payload: EarlyAccessIn):
+@limiter.limit("5/minute")
+async def early_access_signup(request: Request, payload: EarlyAccessIn):
     """Public — capture early access signups from the marketing landing page."""
+    # Honeypot: silently accept (so bots don't learn) but never store the record.
+    if payload.company and payload.company.strip():
+        logger.info("Early-access honeypot tripped from %s", _client_ip(request))
+        return {"ok": True, "already_registered": False}
+
     email = payload.email.lower().strip()
-    role = (payload.role or "").strip()[:40] if payload.role else None
-    source = (payload.source or "landing").strip()[:40]
+    # Defensive cap: EmailStr already validates format, but cap length to be safe in storage.
+    if len(email) > 254:
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    role = sanitize_str(payload.role, max_len=40)
+    source = sanitize_str(payload.source, max_len=40) or "landing"
 
     existing = await db.early_access.find_one({"email": email})
     if existing:
@@ -1154,13 +1246,15 @@ async def early_access_signup(payload: EarlyAccessIn):
         "email": email,
         "role": role,
         "source": source,
+        "ip_hash": hashlib.sha256(_client_ip(request).encode()).hexdigest()[:16],
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return {"ok": True, "already_registered": False}
 
 
 @api_router.get("/early-access/count")
-async def early_access_count():
+@limiter.limit("60/minute")
+async def early_access_count(request: Request):
     """Public — show a count of early access signups for social proof."""
     n = await db.early_access.count_documents({})
     return {"count": n}
@@ -1546,13 +1640,26 @@ async def razorpay_webhook(request: Request):
 # ============== App Setup ==============
 app.include_router(api_router)
 
+# Lock CORS to known origins (preview + production). Falls back to "*" only in dev.
+_extra_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+ALLOWED_ORIGINS = list({
+    "https://leadforge-ai-4.preview.emergentagent.com",
+    "https://leadforge.app",
+    "https://www.leadforge.app",
+    *_extra_origins,
+})
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
 )
+
+# Order matters: security headers should run last (i.e., wrap the response from inner middleware/routes).
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 @app.on_event("startup")
@@ -1560,6 +1667,15 @@ async def startup_event():
     await db.users.create_index("email", unique=True)
     await db.leads.create_index("reddit_id")
     await db.user_leads.create_index([("user_id", 1), ("lead_id", 1)])
+    try:
+        await db.early_access.create_index("email", unique=True)
+    except Exception as e:
+        # Existing data may have duplicates from earlier testing — fall back to a non-unique index.
+        logger.warning("Could not create unique index on early_access.email (%s); using non-unique.", e)
+        try:
+            await db.early_access.create_index("email")
+        except Exception:
+            pass
     logger.info("LeadForge AI API started")
     logger.info(f"Razorpay enabled: {RAZORPAY_ENABLED}")
 

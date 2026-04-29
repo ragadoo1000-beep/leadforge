@@ -256,6 +256,8 @@ export default function LandingScreen() {
   const [showRoleMenu, setShowRoleMenu] = useState(false);
   const [count, setCount] = useState<number | null>(null);
   const [legalKey, setLegalKey] = useState<null | "privacy" | "terms" | "disclaimer">(null);
+  // Honeypot — must remain empty. If a bot auto-fills it, we silently drop the request server-side.
+  const [hp, setHp] = useState("");
 
   const heroEmailRef = useRef<TextInput>(null);
   const ctaSectionRef = useRef<View>(null);
@@ -271,14 +273,24 @@ export default function LandingScreen() {
   const onSubmit = async () => {
     setSubmitError(null);
     setSubmittedMsg(null);
-    const e = email.trim();
-    if (!e || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) {
-      setSubmitError("Please enter a valid email.");
+    const e = email.trim().toLowerCase();
+    // Strict RFC-ish email validation: local + @ + domain with TLD ≥ 2 chars, max 254 chars.
+    const emailOk =
+      e.length > 0 &&
+      e.length <= 254 &&
+      /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(e);
+    if (!emailOk) {
+      setSubmitError("Please enter a valid email address.");
       return;
     }
     setSubmitting(true);
     try {
-      const res = await api.earlyAccessSignup({ email: e, role: role || undefined, source: "landing" });
+      const res = await api.earlyAccessSignup({
+        email: e,
+        role: role || undefined,
+        source: "landing",
+        company: hp || undefined, // honeypot — should always be empty for real humans
+      });
       if (res?.already_registered) {
         setSubmittedMsg("You're already on the list. We'll be in touch soon.");
       } else {
@@ -286,10 +298,18 @@ export default function LandingScreen() {
       }
       setEmail("");
       setRole("");
-      // refresh counter optimistically
+      setHp("");
       setCount((c) => (c == null ? c : c + 1));
     } catch (err: any) {
-      setSubmitError(err?.message || "Something went wrong. Try again.");
+      // Never surface raw server errors. Use a generic, friendly message.
+      const msg = err?.message || "";
+      if (msg.toLowerCase().includes("too many")) {
+        setSubmitError("You're going a bit fast — please try again in a minute.");
+      } else if (msg.toLowerCase().includes("email")) {
+        setSubmitError("Please enter a valid email address.");
+      } else {
+        setSubmitError("Something went wrong. Please try again in a moment.");
+      }
     } finally {
       setSubmitting(false);
     }
@@ -526,6 +546,22 @@ export default function LandingScreen() {
                 { flexDirection: width < 720 ? "column" : "row", gap: 10 },
               ]}
             >
+              {/* Honeypot — hidden from real users, visible to dumb bots that auto-fill all inputs.
+                  We position it off-screen and mark it as autocomplete=off so accessible tooling skips it. */}
+              <View style={s.honeypot} pointerEvents="box-none" aria-hidden>
+                <TextInput
+                  value={hp}
+                  onChangeText={setHp}
+                  placeholder="Company"
+                  // @ts-ignore — react-native-web supports these props
+                  autoComplete="off"
+                  // @ts-ignore
+                  tabIndex={-1}
+                  importantForAutofill="no"
+                  style={s.honeypotInput}
+                />
+              </View>
+
               <View style={[s.inputWrap, { flex: width < 720 ? undefined : 1.4 }]}>
                 <Ionicons name="mail-outline" size={16} color={C.textMuted} />
                 <TextInput
@@ -1155,6 +1191,23 @@ const s = StyleSheet.create({
     ...(Platform.OS === "web" ? ({ outlineStyle: "none" } as any) : {}),
   },
   selectWrap: { position: "relative", zIndex: 5 },
+  // Honeypot field — visually offscreen so real users never see it. Bots auto-fill it and we drop the request.
+  honeypot: {
+    position: "absolute",
+    width: 1,
+    height: 1,
+    opacity: 0,
+    overflow: "hidden",
+    pointerEvents: "none" as any,
+    left: -9999,
+    top: -9999,
+  },
+  honeypotInput: {
+    width: 1,
+    height: 1,
+    color: "transparent",
+    ...(Platform.OS === "web" ? ({ outlineStyle: "none" } as any) : {}),
+  },
   selectBtn: {
     height: 48,
     paddingHorizontal: 14,
