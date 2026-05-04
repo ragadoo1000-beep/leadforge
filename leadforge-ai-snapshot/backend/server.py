@@ -1,0 +1,1825 @@
+from dotenv import load_dotenv
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+import os
+import re
+import uuid
+import json
+import hmac
+import hashlib
+import logging
+import bcrypt
+import jwt
+import httpx
+import razorpay
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Literal
+
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, BackgroundTasks
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, EmailStr
+
+from emergentintegrations.llm.chat import LlmChat, UserMessage
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# ============== Setup ==============
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+JWT_SECRET = os.environ['JWT_SECRET']
+JWT_ALGO = "HS256"
+EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
+
+RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', '').strip()
+RAZORPAY_KEY_SECRET = os.environ.get('RAZORPAY_KEY_SECRET', '').strip()
+RAZORPAY_WEBHOOK_SECRET = os.environ.get('RAZORPAY_WEBHOOK_SECRET', '').strip()
+RAZORPAY_ENABLED = bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)) if RAZORPAY_ENABLED else None
+
+app = FastAPI(title="LeadForge AI API", docs_url=None, redoc_url=None, openapi_url=None)
+api_router = APIRouter(prefix="/api")
+security = HTTPBearer(auto_error=False)
+
+
+# ============== Rate Limiting ==============
+def _client_ip(request: StarletteRequest) -> str:
+    """Extract client IP, honoring common proxy headers (Emergent ingress)."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_client_ip, default_limits=["120/minute"])
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: StarletteRequest, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many requests. Please slow down and try again in a moment."},
+    )
+
+
+# ============== Security Headers ==============
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response: Response = await call_next(request)
+        # Generic, web-safe headers — strict but won't block a normal landing page UI.
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        # CSP: allow self + https assets so the landing page (and its fonts/images) renders cleanly.
+        # We still lock framing, base URI, plugins, and forms — the parts that matter for clickjacking
+        # and content-injection attacks. 'unsafe-inline' on style is needed for React Native Web's
+        # inline styles; 'unsafe-inline' on script is needed for Expo Router's hydration shim.
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https:; "
+            "img-src 'self' data: blob: https:; "
+            "font-src 'self' data: https://fonts.gstatic.com https:; "
+            "connect-src 'self' https:; "
+            "media-src 'self' https: data:; "
+            "object-src 'none'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'"
+        )
+        # Long-lived HTTPS lock (Emergent ingress is HTTPS).
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+
+# ============== Generic Error Handler ==============
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: StarletteRequest, exc: Exception):
+    """Log internal error server-side; never leak the stack trace to clients."""
+    logger_safe = logging.getLogger(__name__)
+    logger_safe.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong. Please try again."},
+    )
+
+
+# ============== Input Sanitization ==============
+_CTRL_CHARS = "".join(map(chr, list(range(0, 32)) + [127]))
+_CTRL_TABLE = str.maketrans({c: None for c in _CTRL_CHARS if c not in "\n\t"})
+
+
+def sanitize_str(value: Optional[str], max_len: int = 200) -> Optional[str]:
+    """Strip control chars, trim, cap length. Use for any user-supplied free text."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    cleaned = value.translate(_CTRL_TABLE).strip()
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len]
+    return cleaned
+
+
+# ============== PII-safe Logging Helpers ==============
+def mask_email(email: Optional[str]) -> str:
+    """Return a privacy-safe representation of an email for logs.
+    foo@example.com  -> f**@example.com
+    ab@example.com   -> a*@example.com
+    Single-char or invalid input collapses to '***'.
+    """
+    if not email or "@" not in email:
+        return "***"
+    try:
+        local, domain = email.split("@", 1)
+        local = local.strip()
+        if len(local) <= 1:
+            return "***"
+        return f"{local[0]}{'*' * max(1, len(local) - 1)}@{domain}"
+    except Exception:
+        return "***"
+
+
+# ============== Access / Request Logging ==============
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    """Lightweight per-request logger for /api/* — server-side only, no payloads, no PII.
+
+    Format:  ACCESS METHOD PATH -> STATUS in DURATIONms (ip=HASH)
+    The IP is hashed (truncated SHA256) so we can correlate suspicious patterns without
+    storing raw client IPs in logs.
+    """
+
+    async def dispatch(self, request: StarletteRequest, call_next):
+        if not request.url.path.startswith("/api/"):
+            return await call_next(request)
+        start = datetime.now(timezone.utc)
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+        except Exception:
+            # Re-raise so the global exception handler runs; but still log the failure.
+            duration_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+            ip_hash = hashlib.sha256(_client_ip(request).encode()).hexdigest()[:8]
+            logger.exception(
+                "ACCESS %s %s -> 500 in %sms (ip=%s)",
+                request.method, request.url.path, duration_ms, ip_hash,
+            )
+            raise
+        duration_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+        ip_hash = hashlib.sha256(_client_ip(request).encode()).hexdigest()[:8]
+        # Use WARNING for 4xx/5xx so they stand out in log scans; INFO for 2xx/3xx.
+        level = logging.WARNING if status_code >= 400 else logging.INFO
+        logger.log(
+            level,
+            "ACCESS %s %s -> %s in %sms (ip=%s)",
+            request.method, request.url.path, status_code, duration_ms, ip_hash,
+        )
+        return response
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# ============== Helpers ==============
+def hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(pw: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+def create_token(user_id: str, email: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.now(timezone.utc) + timedelta(days=30),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+async def get_current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
+    if not creds or not creds.credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALGO])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+# ============== Models ==============
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+    name: str
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    profession: Optional[str] = None
+    skills: Optional[List[str]] = None
+    experience_level: Optional[Literal["Beginner", "Intermediate", "Advanced"]] = None
+    portfolio_links: Optional[List[str]] = None
+    pricing_range: Optional[str] = None
+    tone_preference: Optional[Literal["Formal", "Casual", "Persuasive"]] = None
+
+
+class FetchLeadsIn(BaseModel):
+    subreddits: List[str] = Field(default_factory=lambda: ["forhire", "freelance", "slavelabour"])
+    keywords: List[str] = Field(default_factory=lambda: ["hire", "looking for", "need", "designer", "developer"])
+    hours: int = 72
+
+
+class GenerateMessageIn(BaseModel):
+    lead_id: str
+    tone: Optional[Literal["Formal", "Casual", "Persuasive"]] = None
+
+
+class SaveLeadIn(BaseModel):
+    lead_id: str
+    status: Literal["new", "saved", "contacted", "replied", "closed"] = "saved"
+    notes: Optional[str] = ""
+
+
+class UpdateUserLeadIn(BaseModel):
+    status: Optional[Literal["new", "saved", "contacted", "replied", "closed"]] = None
+    notes: Optional[str] = None
+
+
+class InvoiceIn(BaseModel):
+    client_name: str
+    description: str
+    amount: float
+    date: Optional[str] = None
+
+
+# ============== Auth Endpoints ==============
+@api_router.post("/auth/register")
+@limiter.limit("10/minute")
+async def register(request: Request, payload: RegisterIn):
+    email = payload.email.lower()
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user_id = str(uuid.uuid4())
+    user_doc = {
+        "id": user_id,
+        "email": email,
+        "name": sanitize_str(payload.name, max_len=80) or "",
+        "password_hash": hash_password(payload.password),
+        "profession": "",
+        "skills": [],
+        "experience_level": "Beginner",
+        "portfolio_links": [],
+        "pricing_range": "",
+        "tone_preference": "Casual",
+        "is_premium": False,
+        "xp": 0,
+        "streak": 0,
+        "last_active_date": None,
+        "messages_today": 0,
+        "leads_today": 0,
+        "today_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "onboarded": False,
+    }
+    await db.users.insert_one(user_doc)
+    token = create_token(user_id, email)
+    user_doc.pop("_id", None)
+    user_doc.pop("password_hash", None)
+    return {"token": token, "user": user_doc}
+
+
+@api_router.post("/auth/login")
+@limiter.limit("10/minute")
+async def login(request: Request, payload: LoginIn):
+    email = payload.email.lower()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_token(user["id"], email)
+    user.pop("_id", None)
+    user.pop("password_hash", None)
+    return {"token": token, "user": user}
+
+
+@api_router.get("/auth/me")
+async def me(user: dict = Depends(get_current_user)):
+    return user
+
+
+@api_router.put("/auth/profile")
+async def update_profile(payload: ProfileUpdate, user: dict = Depends(get_current_user)):
+    update = {k: v for k, v in payload.dict().items() if v is not None}
+    if update:
+        update["onboarded"] = True
+        await db.users.update_one({"id": user["id"]}, {"$set": update})
+    fresh = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password_hash": 0})
+    return fresh
+
+
+@api_router.post("/auth/toggle-premium")
+async def toggle_premium(user: dict = Depends(get_current_user)):
+    new_val = not user.get("is_premium", False)
+    await db.users.update_one({"id": user["id"]}, {"$set": {"is_premium": new_val}})
+    return {"is_premium": new_val}
+
+
+# ============== Social Auth (Google + Apple) ==============
+async def find_or_create_social_user(email: str, name: str, picture: Optional[str] = None, provider: str = "google") -> dict:
+    email = email.lower()
+    user = await db.users.find_one({"email": email})
+    if user:
+        updates = {"auth_provider": provider}
+        if picture and not user.get("picture"):
+            updates["picture"] = picture
+        if not user.get("name"):
+            updates["name"] = name
+        await db.users.update_one({"id": user["id"]}, {"$set": updates})
+        user.update(updates)
+        return user
+    user_id = str(uuid.uuid4())
+    user_doc = {
+        "id": user_id,
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "auth_provider": provider,
+        "password_hash": "",  # no password for social
+        "profession": "",
+        "skills": [],
+        "experience_level": "Beginner",
+        "portfolio_links": [],
+        "pricing_range": "",
+        "tone_preference": "Casual",
+        "is_premium": False,
+        "xp": 0,
+        "streak": 0,
+        "last_active_date": None,
+        "messages_today": 0,
+        "leads_today": 0,
+        "today_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "onboarded": False,
+    }
+    await db.users.insert_one(user_doc)
+    return user_doc
+
+
+class GoogleSessionIn(BaseModel):
+    session_id: str
+
+
+@api_router.post("/auth/google-session")
+async def google_session(payload: GoogleSessionIn):
+    """Exchange an Emergent OAuth session_id for our JWT.
+    REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as hc:
+            r = await hc.get(
+                "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+                headers={"X-Session-ID": payload.session_id},
+            )
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid or expired Google session")
+        data = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Google session exchange failed: {e}")
+        raise HTTPException(status_code=502, detail="Could not verify Google session")
+
+    email = data.get("email")
+    name = data.get("name") or (email.split("@")[0] if email else "User")
+    if not email:
+        raise HTTPException(status_code=400, detail="Google session missing email")
+    user = await find_or_create_social_user(email, name, data.get("picture"), "google")
+    token = create_token(user["id"], user["email"])
+    user.pop("_id", None)
+    user.pop("password_hash", None)
+    return {"token": token, "user": user}
+
+
+class AppleAuthIn(BaseModel):
+    identity_token: str
+    name: Optional[str] = None
+    email: Optional[str] = None  # Apple only sends email on first login
+
+
+async def _verify_apple_identity_token(identity_token: str) -> dict:
+    """Verify Apple ID token via JWKS. Returns claims."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as hc:
+            keys_resp = await hc.get("https://appleid.apple.com/auth/keys")
+        jwks = keys_resp.json()
+        unverified_header = jwt.get_unverified_header(identity_token)
+        kid = unverified_header.get("kid")
+        key = None
+        for k in jwks.get("keys", []):
+            if k.get("kid") == kid:
+                key = k
+                break
+        if not key:
+            raise HTTPException(status_code=401, detail="Apple key not found")
+        from jwt.algorithms import RSAAlgorithm
+        public_key = RSAAlgorithm.from_jwk(json.dumps(key))
+        # We don't enforce audience because the bundle ID may vary per build environment
+        claims = jwt.decode(
+            identity_token,
+            public_key,
+            algorithms=["RS256"],
+            options={"verify_aud": False},
+        )
+        if claims.get("iss") != "https://appleid.apple.com":
+            raise HTTPException(status_code=401, detail="Invalid Apple token issuer")
+        return claims
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Apple token verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid Apple token")
+
+
+@api_router.post("/auth/apple")
+async def apple_auth(payload: AppleAuthIn):
+    claims = await _verify_apple_identity_token(payload.identity_token)
+    email = claims.get("email") or payload.email
+    sub = claims.get("sub")
+    if not email:
+        # Apple omits email on subsequent sign-ins — synthesize a stable identifier
+        if not sub:
+            raise HTTPException(status_code=400, detail="Apple token missing both email and sub")
+        email = f"apple_{sub[:24]}@apple.local"
+    name = payload.name or email.split("@")[0]
+    user = await find_or_create_social_user(email, name, None, "apple")
+    token = create_token(user["id"], user["email"])
+    user.pop("_id", None)
+    user.pop("password_hash", None)
+    return {"token": token, "user": user}
+
+
+# ============== Reddit Fetching ==============
+async def fetch_reddit_posts(subreddit: str, hours: int = 72) -> List[dict]:
+    url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25&raw_json=1"
+    headers = {
+        "User-Agent": "web:LeadForgeAI:v1.0 (by /u/leadforge_app)",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as hc:
+            r = await hc.get(url, headers=headers)
+            if r.status_code != 200:
+                logger.warning(f"Reddit {subreddit} returned {r.status_code}")
+                return []
+            try:
+                data = r.json()
+            except Exception:
+                logger.warning(f"Reddit {subreddit} non-JSON response")
+                return []
+        cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+        out = []
+        for child in data.get("data", {}).get("children", []):
+            p = child.get("data", {})
+            if p.get("created_utc", 0) < cutoff:
+                continue
+            out.append({
+                "title": p.get("title", ""),
+                "content": p.get("selftext", "")[:1500],
+                "subreddit": subreddit,
+                "url": f"https://reddit.com{p.get('permalink', '')}",
+                "author": p.get("author", "[deleted]"),
+                "created_utc": p.get("created_utc", 0),
+                "reddit_id": p.get("id", ""),
+            })
+        return out
+    except Exception as e:
+        logger.error(f"Reddit fetch error {subreddit}: {e}")
+        return []
+
+
+def keyword_match(post: dict, keywords: List[str]) -> bool:
+    text = (post.get("title", "") + " " + post.get("content", "")).lower()
+    return any(kw.lower() in text for kw in keywords)
+
+
+# Demo seed leads — used when Reddit is unreachable (e.g., dev container IP blocked)
+DEMO_LEADS = [
+    {
+        "title": "[Hiring] Looking for a React Native developer for fitness app — $3k-5k",
+        "content": "We're a YC-backed startup building a fitness tracking app. Need a senior RN dev to help us ship our MVP in 6 weeks. Budget is $3-5k for the contract. Must have experience with HealthKit and Reanimated. DM me your portfolio and rate.",
+        "subreddit": "forhire",
+        "author": "founder_jake",
+        "permalink": "/r/forhire/comments/demo1",
+        "id": "demo_lead_1",
+    },
+    {
+        "title": "[HIRING] Need a logo designer for SaaS product launching next month",
+        "content": "Launching a B2B analytics SaaS in 3 weeks. Need a clean, modern logo + minimal brand guide (colors, typography). Budget $400-600. Looking for someone who can deliver 3 concepts within a week. Show me your latest work.",
+        "subreddit": "forhire",
+        "author": "saas_builder",
+        "permalink": "/r/forhire/comments/demo2",
+        "id": "demo_lead_2",
+    },
+    {
+        "title": "Looking for a copywriter to write landing page + 5 emails",
+        "content": "Need conversion-focused copy for a new productivity tool. Landing page (hero, features, pricing, FAQ) plus 5-email onboarding sequence. SaaS experience strongly preferred. Pay: $800 fixed.",
+        "subreddit": "freelance",
+        "author": "ops_mary",
+        "permalink": "/r/freelance/comments/demo3",
+        "id": "demo_lead_3",
+    },
+    {
+        "title": "Need help with SEO audit + technical fixes for ecommerce store",
+        "content": "Shopify store doing $20k/mo. Traffic is flat. Looking for an SEO consultant to do a full audit, fix technical issues, and recommend a content strategy. Hourly or project-based.",
+        "subreddit": "freelance",
+        "author": "shopify_owner",
+        "permalink": "/r/freelance/comments/demo4",
+        "id": "demo_lead_4",
+    },
+    {
+        "title": "[HIRING] UI/UX designer for a Web3 dashboard (Figma)",
+        "content": "Need a designer to redesign our dashboard. ~8-10 screens. Crypto/DeFi experience is a big plus. We have a vague brand kit but want fresh eyes. $1500-2500.",
+        "subreddit": "forhire",
+        "author": "defi_dan",
+        "permalink": "/r/forhire/comments/demo5",
+        "id": "demo_lead_5",
+    },
+    {
+        "title": "Looking for a video editor for short-form content (TikTok/Reels)",
+        "content": "Personal brand growing fast. Need someone to cut 4 short-form videos per week from long podcast recordings. Add captions, b-roll, hooks. ~$300/week ongoing.",
+        "subreddit": "forhire",
+        "author": "creator_alex",
+        "permalink": "/r/forhire/comments/demo6",
+        "id": "demo_lead_6",
+    },
+    {
+        "title": "Need a Python developer to build a data scraping pipeline",
+        "content": "Want to scrape 5 e-commerce sites daily, store in Postgres, and email a summary. Should take 1-2 weeks. Budget $1k-1.5k. Bonus if you know AWS.",
+        "subreddit": "freelance",
+        "author": "data_curious",
+        "permalink": "/r/freelance/comments/demo7",
+        "id": "demo_lead_7",
+    },
+    {
+        "title": "[HIRING] Full-stack developer for a 3-month MVP build",
+        "content": "Building a marketplace for local services. Stack: Next.js + Supabase. Need someone who can own backend + frontend. Budget $8k for 3 months part-time.",
+        "subreddit": "forhire",
+        "author": "marketplace_mike",
+        "permalink": "/r/forhire/comments/demo8",
+        "id": "demo_lead_8",
+    },
+    {
+        "title": "Looking for a freelancer for one-off Webflow site",
+        "content": "Need a 5-page Webflow site for my consulting business. Have rough wireframes and brand assets. Budget $700.",
+        "subreddit": "slavelabour",
+        "author": "consult_carla",
+        "permalink": "/r/slavelabour/comments/demo9",
+        "id": "demo_lead_9",
+    },
+    {
+        "title": "Need a mobile app developer for a meditation app — long term",
+        "content": "Indie founder. Built v1 myself but need help scaling. Looking for a Flutter/RN dev for ongoing weekly work, 10-15 hours. $40-60/hr depending on experience.",
+        "subreddit": "forhire",
+        "author": "mind_founder",
+        "permalink": "/r/forhire/comments/demo10",
+        "id": "demo_lead_10",
+    },
+]
+
+
+def get_demo_posts() -> List[dict]:
+    """Return demo leads with current timestamps and unique IDs per call."""
+    out = []
+    now = datetime.now(timezone.utc).timestamp()
+    for i, p in enumerate(DEMO_LEADS):
+        out.append({
+            "title": p["title"],
+            "content": p["content"],
+            "subreddit": p["subreddit"],
+            "url": f"https://reddit.com{p['permalink']}",
+            "author": p["author"],
+            "created_utc": now - (i * 1800 + 600),  # spread 30 min apart
+            "reddit_id": f"{p['id']}_{int(now)}",
+        })
+    return out
+
+
+# ============== AI Lead Scoring ==============
+async def ai_score_lead(title: str, body: str) -> dict:
+    """Score a lead using Gemini Flash. Returns {score, intent, summary, spam_score, spam_flags}."""
+    system = (
+        "You are a lead qualification AI for freelancers. Analyze Reddit posts where "
+        "people might be hiring. Return ONLY valid JSON, no markdown, no extra text. "
+        "Never produce content that promotes spam, guarantees outcomes, or encourages mass outreach."
+    )
+    prompt = f"""Analyze this Reddit post and return JSON with these exact keys:
+- "score": integer 0-100 (lead quality; high if clear requirement, budget mentioned, urgency)
+- "intent": "High" | "Medium" | "Low"
+- "summary": one short sentence describing the client need (max 20 words)
+- "spam_score": integer 0-100 (TRUST score, higher = more legitimate, lower = more spammy)
+- "spam_flags": array of short strings flagging issues, choose from:
+   ["no-budget", "vague-scope", "too-short", "suspicious-url", "mlm-or-pyramid", "low-effort", "duplicate-pattern", "unrealistic-rate", "looks-legit"]
+
+Post Title: {title}
+Post Body: {body[:1200]}
+
+Return ONLY JSON like: {{"score": 85, "intent": "High", "summary": "...", "spam_score": 90, "spam_flags": ["looks-legit"]}}"""
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"score-{uuid.uuid4()}",
+            system_message=system,
+        ).with_model("gemini", "gemini-3-flash-preview")
+        resp = await chat.send_message(UserMessage(text=prompt))
+        m = re.search(r'\{.*\}', resp, re.DOTALL)
+        if not m:
+            return {"score": 50, "intent": "Medium", "summary": title[:100], "spam_score": 60, "spam_flags": ["unverified"]}
+        result = json.loads(m.group(0))
+        return {
+            "score": int(max(0, min(100, result.get("score", 50)))),
+            "intent": result.get("intent", "Medium"),
+            "summary": str(result.get("summary", title))[:200],
+            "spam_score": int(max(0, min(100, result.get("spam_score", 60)))),
+            "spam_flags": [str(f) for f in (result.get("spam_flags") or [])][:6],
+        }
+    except Exception as e:
+        logger.error(f"AI scoring error: {e}")
+        # Heuristic fallback
+        text_len = len(body)
+        has_budget = bool(re.search(r"\$\d|\d+/hr|\d+\s?usd|budget", (title + body).lower()))
+        spam_score = 60
+        flags = []
+        if not has_budget:
+            spam_score -= 15
+            flags.append("no-budget")
+        if text_len < 80:
+            spam_score -= 20
+            flags.append("too-short")
+        return {
+            "score": 50,
+            "intent": "Medium",
+            "summary": title[:100],
+            "spam_score": max(0, spam_score),
+            "spam_flags": flags or ["unverified"],
+        }
+
+
+# ============== Lead Verification Helpers ==============
+async def fetch_reddit_user_profile(username: str) -> Optional[dict]:
+    if not username or username == "[deleted]":
+        return None
+    url = f"https://www.reddit.com/user/{username}/about.json"
+    headers = {
+        "User-Agent": "web:LeadForgeAI:v1.0 (by /u/leadforge_app)",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as hc:
+            r = await hc.get(url, headers=headers)
+            if r.status_code != 200:
+                return None
+            try:
+                d = r.json().get("data", {})
+            except Exception:
+                return None
+        karma = int(d.get("link_karma", 0) + d.get("comment_karma", 0))
+        created = d.get("created_utc", 0) or 0
+        age_days = int((datetime.now(timezone.utc).timestamp() - created) / 86400) if created else 0
+        return {
+            "karma": karma,
+            "age_days": age_days,
+            "verified_email": bool(d.get("verified", False)),
+            "is_employee": bool(d.get("is_employee", False)),
+            "icon": d.get("icon_img", "").split("?")[0] if d.get("icon_img") else None,
+        }
+    except Exception as e:
+        logger.warning(f"Reddit user fetch failed for {username}: {e}")
+        return None
+
+
+def demo_poster_profile(username: str) -> dict:
+    """Generate plausible reputation data when Reddit is unreachable."""
+    seed = sum(ord(c) for c in (username or "anon"))
+    karma = (seed * 37) % 18000 + 50
+    age_days = (seed * 11) % 1500 + 30
+    return {
+        "karma": karma,
+        "age_days": age_days,
+        "verified_email": (seed % 3) != 0,
+        "is_employee": False,
+        "icon": None,
+        "source": "demo",
+    }
+
+
+async def check_url_alive(url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as hc:
+            r = await hc.head(url, headers={"User-Agent": "web:LeadForgeAI:v1.0"})
+            if r.status_code in (405, 403):
+                # Some hosts reject HEAD; fall back to GET
+                r = await hc.get(url, headers={"User-Agent": "web:LeadForgeAI:v1.0"})
+            return 200 <= r.status_code < 400
+    except Exception:
+        return False
+
+
+def compute_poster_trust(profile: dict) -> dict:
+    """Convert raw profile to trust signals."""
+    karma = profile.get("karma", 0)
+    age_days = profile.get("age_days", 0)
+    flags = []
+    score = 50
+    if age_days >= 365:
+        score += 25
+    elif age_days >= 90:
+        score += 10
+    elif age_days < 14:
+        score -= 25
+        flags.append("new-account")
+    if karma >= 1000:
+        score += 25
+    elif karma >= 100:
+        score += 10
+    elif karma < 10:
+        score -= 20
+        flags.append("low-karma")
+    if profile.get("verified_email"):
+        score += 5
+    score = max(0, min(100, score))
+    label = "Trusted" if score >= 70 else ("Caution" if score >= 40 else "Risky")
+    return {"score": score, "label": label, "flags": flags}
+
+
+# ============== Lead Endpoints ==============
+def reset_daily_counters_if_needed(user: dict) -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if user.get("today_date") != today:
+        return {"today_date": today, "messages_today": 0, "leads_today": 0}
+    return {}
+
+
+@api_router.post("/leads/fetch")
+async def fetch_leads(payload: FetchLeadsIn, user: dict = Depends(get_current_user)):
+    # Daily reset
+    reset = reset_daily_counters_if_needed(user)
+    if reset:
+        await db.users.update_one({"id": user["id"]}, {"$set": reset})
+        user.update(reset)
+
+    # Free tier: max 10 leads/day; tiered users get higher caps
+    limits = get_user_limits(user)
+    leads_today = user.get("leads_today", 0)
+    daily_cap = limits["leads_per_day"]
+    remaining = max(0, daily_cap - leads_today)
+    if remaining == 0:
+        return {"leads": [], "remaining": 0, "limit_reached": True}
+
+    # Fetch from Reddit
+    all_posts = []
+    for sr in payload.subreddits[:5]:
+        posts = await fetch_reddit_posts(sr, payload.hours)
+        all_posts.extend(posts)
+
+    # Demo fallback if Reddit unreachable from this environment
+    demo_mode = False
+    if not all_posts:
+        all_posts = get_demo_posts()
+        demo_mode = True
+
+    # Filter by keywords
+    filtered = [p for p in all_posts if keyword_match(p, payload.keywords)]
+    if demo_mode and not filtered:
+        # Demo data should always pass keyword filter; bypass if needed
+        filtered = all_posts
+    # Dedupe against existing leads
+    existing_ids = set()
+    if filtered:
+        existing = await db.leads.find(
+            {"reddit_id": {"$in": [p["reddit_id"] for p in filtered]}},
+            {"reddit_id": 1, "_id": 0}
+        ).to_list(500)
+        existing_ids = {e["reddit_id"] for e in existing}
+    new_posts = [p for p in filtered if p["reddit_id"] not in existing_ids][:remaining]
+
+    # Score each new post via AI
+    saved_leads = []
+    for p in new_posts:
+        ai = await ai_score_lead(p["title"], p["content"])
+        lead_doc = {
+            "id": str(uuid.uuid4()),
+            "title": p["title"],
+            "content": p["content"],
+            "subreddit": p["subreddit"],
+            "url": p["url"],
+            "author": p["author"],
+            "reddit_id": p["reddit_id"],
+            "score": ai["score"],
+            "intent": ai["intent"],
+            "summary": ai["summary"],
+            "spam_score": ai.get("spam_score", 60),
+            "spam_flags": ai.get("spam_flags", []),
+            "verified_by": [],
+            "poster_profile": None,
+            "poster_trust": None,
+            "freshness": None,
+            "timestamp": datetime.fromtimestamp(p["created_utc"], tz=timezone.utc).isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.leads.insert_one(lead_doc)
+        lead_doc.pop("_id", None)
+        saved_leads.append(lead_doc)
+
+    # Get cached leads (existing in DB) too — sorted by recency
+    cached = await db.leads.find(
+        {"reddit_id": {"$in": list(existing_ids)}},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(remaining)
+
+    combined = saved_leads + cached
+    combined = sorted(combined, key=lambda x: x.get("score", 0), reverse=True)[:remaining + len(cached)]
+
+    # Increment counter for new leads only
+    if saved_leads:
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$inc": {"leads_today": len(saved_leads), "xp": len(saved_leads) * 2}}
+        )
+
+    return {
+        "leads": combined,
+        "new_count": len(saved_leads),
+        "remaining": max(0, daily_cap - leads_today - len(saved_leads)),
+        "limit_reached": False,
+        "demo_mode": demo_mode,
+    }
+
+
+@api_router.get("/leads/feed")
+async def get_feed(user: dict = Depends(get_current_user)):
+    """Return recent leads from DB (no fresh fetch)."""
+    leads = await db.leads.find({}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    # Annotate with user's saved status
+    user_lead_map = {}
+    user_leads = await db.user_leads.find({"user_id": user["id"]}, {"_id": 0}).to_list(500)
+    for ul in user_leads:
+        user_lead_map[ul["lead_id"]] = ul["status"]
+    for lead in leads:
+        lead["my_status"] = user_lead_map.get(lead["id"])
+    return {"leads": leads}
+
+
+@api_router.get("/leads/{lead_id}")
+async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    ul = await db.user_leads.find_one({"user_id": user["id"], "lead_id": lead_id}, {"_id": 0})
+    lead["my_status"] = ul["status"] if ul else None
+    lead["my_notes"] = ul.get("notes", "") if ul else ""
+    lead["i_verified"] = user["id"] in (lead.get("verified_by") or [])
+    lead["verified_count"] = len(lead.get("verified_by") or [])
+    return lead
+
+
+@api_router.post("/leads/{lead_id}/verify")
+async def run_lead_verification(lead_id: str, user: dict = Depends(get_current_user)):
+    """Fetch poster reputation + URL freshness. Caches result on the lead doc."""
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    # Poster profile
+    profile = await fetch_reddit_user_profile(lead.get("author", ""))
+    demo = False
+    if profile is None:
+        profile = demo_poster_profile(lead.get("author", "anon"))
+        demo = True
+    trust = compute_poster_trust(profile)
+    # Freshness
+    alive = await check_url_alive(lead.get("url", "")) if not demo else True
+    freshness = {
+        "alive": alive,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "source": "demo" if demo else "live",
+    }
+    update = {
+        "poster_profile": profile,
+        "poster_trust": trust,
+        "freshness": freshness,
+    }
+    await db.leads.update_one({"id": lead_id}, {"$set": update})
+    fresh_lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    fresh_lead["i_verified"] = user["id"] in (fresh_lead.get("verified_by") or [])
+    fresh_lead["verified_count"] = len(fresh_lead.get("verified_by") or [])
+    return fresh_lead
+
+
+@api_router.post("/leads/{lead_id}/mark-verified")
+async def mark_lead_verified(lead_id: str, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    verified_by = set(lead.get("verified_by") or [])
+    if user["id"] in verified_by:
+        verified_by.remove(user["id"])
+        action = "unmarked"
+    else:
+        verified_by.add(user["id"])
+        action = "marked"
+        # +3 XP for community contribution
+        await db.users.update_one({"id": user["id"]}, {"$inc": {"xp": 3}})
+    await db.leads.update_one({"id": lead_id}, {"$set": {"verified_by": list(verified_by)}})
+    return {"action": action, "verified_count": len(verified_by), "i_verified": action == "marked"}
+
+
+# ============== AI Message Generation ==============
+@api_router.post("/leads/generate-message")
+async def generate_message(payload: GenerateMessageIn, user: dict = Depends(get_current_user)):
+    # Daily reset
+    reset = reset_daily_counters_if_needed(user)
+    if reset:
+        await db.users.update_one({"id": user["id"]}, {"$set": reset})
+        user.update(reset)
+
+    limits = get_user_limits(user)
+    msgs_today = user.get("messages_today", 0)
+    daily_cap = limits["messages_per_day"]
+    if msgs_today >= daily_cap:
+        raise HTTPException(status_code=429, detail=f"Daily limit reached ({daily_cap}). Upgrade your plan for more.")
+
+    lead = await db.leads.find_one({"id": payload.lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    tone = payload.tone or user.get("tone_preference", "Casual")
+    profession = user.get("profession", "freelancer")
+    skills = ", ".join(user.get("skills", [])) or "various skills"
+    experience = user.get("experience_level", "Intermediate")
+    portfolio = ", ".join(user.get("portfolio_links", [])) or "Available on request"
+    name = user.get("name", "")
+
+    system = (
+        "You are an expert outreach copywriter for freelancers. Write authentic, "
+        "non-spammy messages that one specific person would send to one specific potential client. "
+        "STRICT CONSTRAINTS: "
+        "(1) NEVER produce templated, generic, or copy-pasteable boilerplate. "
+        "(2) NEVER guarantee results, deliverables, or client acquisition. "
+        "(3) NEVER use pressure tactics, urgency manipulation, or 'limited offer' framing. "
+        "(4) NEVER encourage mass outreach or bulk messaging. "
+        "(5) Always reference something SPECIFIC from the client's actual post — proving the message was written for them, not blasted. "
+        "(6) Keep messages short, human, and respectful of the recipient's time."
+    )
+    prompt = f"""Generate two outreach messages for this freelance opportunity.
+
+FREELANCER PROFILE:
+- Name: {name}
+- Profession: {profession}
+- Skills: {skills}
+- Experience: {experience}
+- Portfolio: {portfolio}
+- Tone: {tone}
+
+CLIENT POST (from r/{lead['subreddit']}):
+Title: {lead['title']}
+Body: {lead['content'][:800]}
+
+Return ONLY valid JSON like:
+{{"reddit_dm": "...", "email": "..."}}
+
+Requirements:
+- Reddit DM: 4-6 lines (max 90 words), casual, reference their SPECIFIC need (mention an actual detail from their post), mention 1 relevant skill, end with a soft non-pressuring CTA (e.g. "happy to chat if it sounds useful")
+- Email: 6-8 lines (max 140 words) with subject line at start (Subject: ...), more formal but {tone.lower()} in tone
+- Do NOT use generic phrases like "I hope this finds you well", "I'd love to learn more", "I'm a hard worker"
+- Do NOT make guarantees (no "I'll definitely deliver", "I guarantee results", "you'll be 100% satisfied")
+- Do NOT use urgency tactics ("limited time", "act now")
+- Do NOT mention price unless the client explicitly asked"""
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"msg-{uuid.uuid4()}",
+            system_message=system,
+        ).with_model("gemini", "gemini-3-flash-preview")
+        resp = await chat.send_message(UserMessage(text=prompt))
+        m = re.search(r'\{.*\}', resp, re.DOTALL)
+        if not m:
+            raise ValueError("No JSON in response")
+        result = json.loads(m.group(0))
+        reddit_dm = str(result.get("reddit_dm", ""))
+        email = str(result.get("email", ""))
+    except Exception as e:
+        logger.error(f"Message gen error: {e}")
+        reddit_dm = f"Hey! Saw your post about {lead['title'][:50]}. I'm a {profession} with experience in {skills}. Happy to chat if you're still looking."
+        email = f"Subject: Re: {lead['title'][:60]}\n\nHi,\n\nI noticed your post and I think I can help. I'm a {profession} specializing in {skills}.\n\nLet me know if you'd like to discuss.\n\nBest,\n{name}"
+
+    # Save generation record
+    msg_doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "lead_id": payload.lead_id,
+        "reddit_dm": reddit_dm,
+        "email": email,
+        "tone": tone,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.messages.insert_one(msg_doc)
+    msg_doc.pop("_id", None)
+
+    # Increment counters
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$inc": {"messages_today": 1, "xp": 5}}
+    )
+
+    return msg_doc
+
+
+# ============== CRM (UserLeads) ==============
+@api_router.post("/userleads")
+async def save_user_lead(payload: SaveLeadIn, user: dict = Depends(get_current_user)):
+    lead = await db.leads.find_one({"id": payload.lead_id}, {"_id": 0})
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    existing = await db.user_leads.find_one({"user_id": user["id"], "lead_id": payload.lead_id})
+    if existing:
+        await db.user_leads.update_one(
+            {"user_id": user["id"], "lead_id": payload.lead_id},
+            {"$set": {"status": payload.status, "notes": payload.notes or existing.get("notes", "")}}
+        )
+        ul = await db.user_leads.find_one({"user_id": user["id"], "lead_id": payload.lead_id}, {"_id": 0})
+        return ul
+    ul_doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "lead_id": payload.lead_id,
+        "status": payload.status,
+        "notes": payload.notes or "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.user_leads.insert_one(ul_doc)
+    ul_doc.pop("_id", None)
+    return ul_doc
+
+
+@api_router.get("/userleads")
+async def list_user_leads(user: dict = Depends(get_current_user)):
+    uls = await db.user_leads.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    # Join with lead data
+    lead_ids = [ul["lead_id"] for ul in uls]
+    leads = await db.leads.find({"id": {"$in": lead_ids}}, {"_id": 0}).to_list(500)
+    lead_map = {ld["id"]: ld for ld in leads}
+    enriched = []
+    for ul in uls:
+        ld = lead_map.get(ul["lead_id"])
+        if ld:
+            enriched.append({**ld, "my_status": ul["status"], "my_notes": ul.get("notes", ""), "user_lead_id": ul["id"]})
+    return {"user_leads": enriched}
+
+
+@api_router.patch("/userleads/{lead_id}")
+async def update_user_lead(lead_id: str, payload: UpdateUserLeadIn, user: dict = Depends(get_current_user)):
+    update = {k: v for k, v in payload.dict().items() if v is not None}
+    if not update:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    await db.user_leads.update_one(
+        {"user_id": user["id"], "lead_id": lead_id},
+        {"$set": update},
+        upsert=True
+    )
+    # XP for status changes
+    if payload.status in ["contacted", "replied", "closed"]:
+        xp_gain = {"contacted": 10, "replied": 20, "closed": 50}[payload.status]
+        await db.users.update_one({"id": user["id"]}, {"$inc": {"xp": xp_gain}})
+    ul = await db.user_leads.find_one({"user_id": user["id"], "lead_id": lead_id}, {"_id": 0})
+    return ul
+
+
+# ============== Invoices ==============
+@api_router.post("/invoices")
+async def create_invoice(payload: InvoiceIn, user: dict = Depends(get_current_user)):
+    inv_doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "freelancer_name": user.get("name", ""),
+        "client_name": payload.client_name,
+        "description": payload.description,
+        "amount": payload.amount,
+        "date": payload.date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "invoice_number": f"INV-{int(datetime.now(timezone.utc).timestamp())}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.invoices.insert_one(inv_doc)
+    inv_doc.pop("_id", None)
+    return inv_doc
+
+
+@api_router.get("/invoices")
+async def list_invoices(user: dict = Depends(get_current_user)):
+    invs = await db.invoices.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return {"invoices": invs}
+
+
+# ============== Stats / Leaderboard ==============
+@api_router.get("/stats/me")
+async def my_stats(user: dict = Depends(get_current_user)):
+    msg_count = await db.messages.count_documents({"user_id": user["id"]})
+    contacted = await db.user_leads.count_documents({"user_id": user["id"], "status": "contacted"})
+    replied = await db.user_leads.count_documents({"user_id": user["id"], "status": "replied"})
+    closed = await db.user_leads.count_documents({"user_id": user["id"], "status": "closed"})
+    return {
+        "xp": user.get("xp", 0),
+        "streak": user.get("streak", 0),
+        "messages_generated": msg_count,
+        "leads_contacted": contacted,
+        "replies": replied,
+        "deals_closed": closed,
+        "is_premium": user.get("is_premium", False),
+        "messages_today": user.get("messages_today", 0),
+        "leads_today": user.get("leads_today", 0),
+    }
+
+
+@api_router.get("/leaderboard")
+async def leaderboard(user: dict = Depends(get_current_user)):
+    top = await db.users.find(
+        {},
+        {"_id": 0, "id": 1, "name": 1, "xp": 1, "streak": 1, "is_premium": 1}
+    ).sort("xp", -1).limit(20).to_list(20)
+    return {"leaderboard": top, "my_id": user["id"]}
+
+
+# ============== Streak Update on Login ==============
+@api_router.post("/auth/check-in")
+async def daily_check_in(user: dict = Depends(get_current_user)):
+    today = datetime.now(timezone.utc).date()
+    last = user.get("last_active_date")
+    streak = user.get("streak", 0)
+    if last:
+        last_date = datetime.fromisoformat(last).date() if isinstance(last, str) else last
+        delta = (today - last_date).days
+        if delta == 0:
+            pass  # same day
+        elif delta == 1:
+            streak += 1
+        else:
+            streak = 1
+    else:
+        streak = 1
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"streak": streak, "last_active_date": today.isoformat()}}
+    )
+    return {"streak": streak}
+
+
+@api_router.get("/")
+async def root():
+    return {"status": "ok", "service": "LeadForge AI"}
+
+
+# ============== Compliance / Policy / Transparency ==============
+
+POLICY_DOC = {
+    "version": "1.0",
+    "disclaimer": (
+        "LeadForge AI is a lead discovery and assistance tool. We do not guarantee "
+        "results, client acquisition, or income. All outreach is initiated and sent "
+        "manually by you. We are not liable for how messages are used."
+    ),
+    "principles": [
+        "User must always initiate outreach manually.",
+        "We never auto-send messages, DMs, or emails.",
+        "We never encourage spam, mass outreach, or bulk messaging.",
+        "We respect Reddit's API rate limits and only fetch public data.",
+        "We do not guarantee outcomes — only assist with discovery and drafting.",
+    ],
+    "third_party_disclaimers": [
+        "LeadForge AI is not affiliated with, endorsed by, or sponsored by Reddit, Inc.",
+        "Reddit and the Reddit logo are trademarks of Reddit, Inc.",
+        "We are an independent tool that helps users discover publicly available posts on Reddit.",
+        "All payment processing is performed by Razorpay; LeadForge never sees or stores your card details.",
+        "AI text is generated by Google Gemini via Emergent integrations and is provided 'as is' with no guarantees of accuracy.",
+    ],
+    "data_collected": [
+        "Account info: email, name, profession, skills, tone preference (you provide)",
+        "Saved leads: post title, body, subreddit, public timestamp, URL, post ID",
+        "Lead author: public Reddit username only (no private data)",
+        "Your private notes and pipeline status on saved leads",
+        "Generated message drafts (so you can review them later)",
+        "Subscription state (tier, period, billing status — payment is handled by Razorpay, never stored by us)",
+    ],
+    "data_not_collected": [
+        "We do not collect Reddit private messages, history, or activity outside the public post",
+        "We do not collect device contacts, location, or biometric data",
+        "We do not store payment card details — Razorpay handles all payment data",
+    ],
+    "how_reddit_works": (
+        "We fetch posts from a small set of public subreddits (r/forhire, r/freelance, r/slavelabour) "
+        "via Reddit's public JSON endpoints. Only the post's title, body, subreddit, timestamp, URL, "
+        "and author username are stored — no private or personal data."
+    ),
+    "how_ai_works": (
+        "We use Gemini 3 Flash to (1) score how relevant a post is for you, (2) summarize the client's need, "
+        "(3) detect spam signals, and (4) draft personalized outreach messages. AI never sends anything — "
+        "it only suggests text. You review, edit, and send manually."
+    ),
+    "user_rights": [
+        "You can delete your account and all associated data at any time (Profile → Delete Account)",
+        "You can cancel your subscription at any time (Profile → Subscription)",
+        "You can export your saved leads as JSON via support request",
+        "All actions are user-controlled — no hidden automation",
+    ],
+    "rate_limits": {
+        "free": "10 leads/day, 5 messages/day",
+        "minimum": "25 leads/day, 12 messages/day",
+        "professional": "100 leads/day, 50 messages/day",
+        "expert": "Unlimited (subject to Reddit and AI provider rate limits)",
+    },
+    "terms_summary": (
+        "By using LeadForge AI you agree: (a) to comply with Reddit's terms when contacting users you "
+        "discover here, (b) to never use this tool for spam or bulk outreach, (c) that we provide no "
+        "warranty or guarantee of income or results, (d) that you alone are responsible for the messages "
+        "you send and the consequences thereof."
+    ),
+    "support_email": "support@leadforge.app",
+}
+
+
+@api_router.get("/policy")
+async def get_policy():
+    """Public — privacy/terms/disclaimer/transparency info."""
+    return POLICY_DOC
+
+
+# ============== Early Access (Public Landing) ==============
+class EarlyAccessIn(BaseModel):
+    email: EmailStr
+    role: Optional[str] = Field(default=None, max_length=40)
+    source: Optional[str] = Field(default=None, max_length=40)
+    # Honeypot field — must remain empty. Bots that auto-fill all inputs will trip this.
+    company: Optional[str] = Field(default=None, max_length=200)
+
+
+# Webhook URL is loaded once on import (set in /app/backend/.env). Empty = disabled.
+EARLY_ACCESS_WEBHOOK_URL = os.environ.get("EARLY_ACCESS_WEBHOOK_URL", "").strip()
+EARLY_ACCESS_WEBHOOK_SECRET = os.environ.get("EARLY_ACCESS_WEBHOOK_SECRET", "").strip()
+
+
+async def _post_early_access_webhook(payload: dict, masked_email: str) -> None:
+    """Fire-and-forget webhook to Zapier/Make/Sheets. Never raises to caller.
+
+    Sends email/role/source/created_at as JSON. Optional shared-secret header so
+    the receiving end can verify it's really us.
+    """
+    url = EARLY_ACCESS_WEBHOOK_URL
+    if not url:
+        return
+    headers = {"Content-Type": "application/json", "User-Agent": "LeadForgeAI-Webhook/1.0"}
+    if EARLY_ACCESS_WEBHOOK_SECRET:
+        headers["X-LeadForge-Signature"] = EARLY_ACCESS_WEBHOOK_SECRET
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as cx:
+            resp = await cx.post(url, json=payload, headers=headers)
+        if resp.status_code >= 400:
+            logger.warning(
+                "WEBHOOK delivery non-2xx email=%s status=%s",
+                masked_email, resp.status_code,
+            )
+        else:
+            logger.info("WEBHOOK delivered email=%s status=%s", masked_email, resp.status_code)
+    except Exception as e:
+        # Never block or fail the user — webhooks are best-effort.
+        logger.warning("WEBHOOK failed email=%s err=%s", masked_email, type(e).__name__)
+
+
+@api_router.post("/early-access/signup")
+@limiter.limit("5/minute")
+async def early_access_signup(
+    request: Request,
+    payload: EarlyAccessIn,
+    background: BackgroundTasks,
+):
+    """Public — capture early access signups from the marketing landing page."""
+    masked = mask_email(payload.email)
+    ip_hash = hashlib.sha256(_client_ip(request).encode()).hexdigest()[:8]
+
+    # Honeypot: silently accept (so bots don't learn) but never store the record.
+    if payload.company and payload.company.strip():
+        logger.warning("SIGNUP honeypot tripped email=%s ip=%s", masked, ip_hash)
+        return {"ok": True, "already_registered": False}
+
+    email = payload.email.lower().strip()
+    if len(email) > 254:
+        logger.warning("SIGNUP rejected reason=email_too_long ip=%s", ip_hash)
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    role = sanitize_str(payload.role, max_len=40)
+    source = sanitize_str(payload.source, max_len=40) or "landing"
+
+    existing = await db.early_access.find_one({"email": email})
+    if existing:
+        logger.info("SIGNUP duplicate email=%s ip=%s source=%s", masked, ip_hash, source)
+        return {"ok": True, "already_registered": True}
+
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    try:
+        await db.early_access.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": email,
+            "role": role,
+            "source": source,
+            "ip_hash": hashlib.sha256(_client_ip(request).encode()).hexdigest()[:16],
+            "created_at": created_at,
+        })
+    except Exception as e:
+        logger.warning("SIGNUP insert race email=%s ip=%s err=%s", masked, ip_hash, type(e).__name__)
+        return {"ok": True, "already_registered": True}
+
+    logger.info("SIGNUP accepted email=%s ip=%s source=%s role=%s", masked, ip_hash, source, role or "-")
+
+    # Fire-and-forget webhook to Zapier/Make/Sheets. Runs AFTER response is sent
+    # to the user, so a slow webhook never delays the form-success UI.
+    if EARLY_ACCESS_WEBHOOK_URL:
+        webhook_payload = {
+            "email": email,
+            "role": role,
+            "source": source,
+            "created_at": created_at,
+        }
+        background.add_task(_post_early_access_webhook, webhook_payload, masked)
+
+    return {"ok": True, "already_registered": False}
+
+
+@api_router.get("/early-access/count")
+@limiter.limit("60/minute")
+async def early_access_count(request: Request):
+    """Public — show a count of early access signups for social proof."""
+    n = await db.early_access.count_documents({})
+    return {"count": n}
+
+
+@api_router.delete("/account")
+async def delete_account(user: dict = Depends(get_current_user)):
+    """Hard-delete the user and all data they own. Cannot be undone."""
+    user_id = user["id"]
+    # Cancel subscription if active
+    sub_id = user.get("subscription_id")
+    if RAZORPAY_ENABLED and sub_id and not str(sub_id).startswith("demo_sub_"):
+        try:
+            razorpay_client.subscription.cancel(sub_id, {"cancel_at_cycle_end": 0})
+        except Exception as e:
+            logger.warning(f"Subscription cancel during account delete failed: {e}")
+    # Delete owned data
+    deleted = {
+        "user_leads": (await db.user_leads.delete_many({"user_id": user_id})).deleted_count,
+        "messages": (await db.messages.delete_many({"user_id": user_id})).deleted_count,
+        "invoices": (await db.invoices.delete_many({"user_id": user_id})).deleted_count,
+        "events": (await db.events.delete_many({"user_id": user_id})).deleted_count,
+    }
+    # Remove user's verified marks from shared leads
+    await db.leads.update_many({"verified_by": user_id}, {"$pull": {"verified_by": user_id}})
+    # Finally remove the user
+    await db.users.delete_one({"id": user_id})
+    return {"deleted": True, "removed": deleted}
+
+
+# ============== Lightweight Analytics ==============
+ALLOWED_EVENTS = {
+    "signup", "login", "lead_fetched", "lead_viewed",
+    "message_generated", "message_copied", "lead_saved",
+    "lead_status_changed", "invoice_created", "subscription_started",
+    "subscription_cancelled", "account_deleted",
+}
+
+
+class TrackEventIn(BaseModel):
+    name: str
+    meta: Optional[dict] = None
+
+
+@api_router.post("/events/track")
+async def track_event(payload: TrackEventIn, user: dict = Depends(get_current_user)):
+    """Internal-only event tracking. Stores event name, user_id, ts. No PII or message content."""
+    if payload.name not in ALLOWED_EVENTS:
+        raise HTTPException(status_code=400, detail="Unknown event")
+    # Strip any keys that look like PII from meta (substring match, case-insensitive)
+    PII_TOKENS = ("email", "phone", "address", "card", "password", "name", "ssn", "tax", "dob", "ip")
+    safe_meta = {}
+    if payload.meta:
+        for k, v in payload.meta.items():
+            kl = k.lower()
+            if any(token in kl for token in PII_TOKENS):
+                continue
+            if isinstance(v, (str, int, float, bool)) and len(str(v)) < 200:
+                safe_meta[k] = v
+    await db.events.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "name": payload.name,
+        "meta": safe_meta,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"tracked": True}
+
+
+@api_router.get("/events/summary")
+async def event_summary(user: dict = Depends(get_current_user)):
+    """User-level only: return counts of the user's own events. No global aggregates exposed."""
+    pipeline = [
+        {"$match": {"user_id": user["id"]}},
+        {"$group": {"_id": "$name", "count": {"$sum": 1}}},
+    ]
+    results = await db.events.aggregate(pipeline).to_list(50)
+    return {"counts": {r["_id"]: r["count"] for r in results}}
+
+
+# ============== Billing / Subscriptions (Razorpay) ==============
+
+# Tier configuration (single source of truth; UI fetches via /billing/plans)
+PLAN_CATALOG = {
+    "minimum": {
+        "name": "Minimum",
+        "tagline": "For freelancers getting started",
+        "monthly_inr": 299,
+        "annual_inr": 2870,
+        "limits": {"leads_per_day": 25, "messages_per_day": 12},
+        "features": [
+            "25 AI-scored leads per day",
+            "12 AI message generations per day",
+            "Basic CRM with 5 pipeline stages",
+            "AI Trust Score (spam detection)",
+            "Manual lead verification",
+        ],
+    },
+    "professional": {
+        "name": "Professional",
+        "tagline": "For active freelancers who win deals",
+        "monthly_inr": 399,
+        "annual_inr": 3830,
+        "limits": {"leads_per_day": 100, "messages_per_day": 50},
+        "features": [
+            "100 AI-scored leads per day",
+            "50 AI message generations per day",
+            "Advanced verification (poster reputation + freshness)",
+            "Priority feed (high-intent first)",
+            "Tone customization & A/B variants",
+            "All Minimum features",
+        ],
+    },
+    "expert": {
+        "name": "Expert",
+        "tagline": "Unlimited firepower for top freelancers",
+        "monthly_inr": 499,
+        "annual_inr": 4790,
+        "limits": {"leads_per_day": 100000, "messages_per_day": 100000},
+        "features": [
+            "Unlimited leads",
+            "Unlimited AI messages",
+            "Priority AI scoring (low latency)",
+            "Advanced analytics dashboard",
+            "Early access to new sources (LinkedIn/X)",
+            "Priority support",
+            "All Professional features",
+        ],
+    },
+}
+TRIAL_DAYS = 7
+
+
+def get_user_limits(user: dict) -> dict:
+    """Return effective leads/messages caps for a user."""
+    tier = user.get("plan_tier") or "free"
+    status = user.get("subscription_status") or "free"
+    if status in ("active", "trial") and tier in PLAN_CATALOG:
+        return PLAN_CATALOG[tier]["limits"]
+    if user.get("is_premium"):
+        # Legacy demo-toggle treats premium as Expert
+        return PLAN_CATALOG["expert"]["limits"]
+    return {"leads_per_day": 10, "messages_per_day": 5}
+
+
+@api_router.get("/billing/plans")
+async def billing_plans():
+    return {
+        "plans": [
+            {"id": tier, **cfg} for tier, cfg in PLAN_CATALOG.items()
+        ],
+        "trial_days": TRIAL_DAYS,
+        "razorpay_enabled": RAZORPAY_ENABLED,
+        "razorpay_key_id": RAZORPAY_KEY_ID if RAZORPAY_ENABLED else None,
+    }
+
+
+@api_router.get("/billing/me")
+async def billing_me(user: dict = Depends(get_current_user)):
+    limits = get_user_limits(user)
+    return {
+        "plan_tier": user.get("plan_tier") or "free",
+        "plan_period": user.get("plan_period"),
+        "subscription_status": user.get("subscription_status") or "free",
+        "subscription_id": user.get("subscription_id"),
+        "trial_ends_at": user.get("trial_ends_at"),
+        "current_period_end": user.get("current_period_end"),
+        "is_premium": user.get("is_premium", False),
+        "limits": limits,
+    }
+
+
+class CreateSubscriptionIn(BaseModel):
+    tier: Literal["minimum", "professional", "expert"]
+    period: Literal["monthly", "annual"]
+
+
+def _ensure_razorpay_plan(tier: str, period: str) -> str:
+    """Get-or-create a Razorpay plan id, cached in db.razorpay_plans."""
+    return ""  # placeholder; the async flow below replaces this
+
+
+async def get_or_create_rzp_plan(tier: str, period: str) -> Optional[str]:
+    if not RAZORPAY_ENABLED:
+        return None
+    cfg = PLAN_CATALOG[tier]
+    interval_unit = "monthly" if period == "monthly" else "yearly"
+    amount_inr = cfg["monthly_inr"] if period == "monthly" else cfg["annual_inr"]
+    cache_key = f"{tier}_{period}"
+    cached = await db.razorpay_plans.find_one({"key": cache_key})
+    if cached and cached.get("plan_id"):
+        return cached["plan_id"]
+    try:
+        plan = razorpay_client.plan.create(
+            data={
+                "period": interval_unit,
+                "interval": 1,
+                "item": {
+                    "name": f"LeadForge {cfg['name']} ({period.capitalize()})",
+                    "amount": amount_inr * 100,  # paise
+                    "currency": "INR",
+                    "description": cfg["tagline"],
+                },
+            }
+        )
+        plan_id = plan["id"]
+        await db.razorpay_plans.update_one(
+            {"key": cache_key},
+            {"$set": {"plan_id": plan_id, "amount_inr": amount_inr, "period": interval_unit}},
+            upsert=True,
+        )
+        return plan_id
+    except Exception as e:
+        logger.error(f"Razorpay plan create failed: {e}")
+        return None
+
+
+@api_router.post("/billing/create-subscription")
+async def create_subscription(payload: CreateSubscriptionIn, user: dict = Depends(get_current_user)):
+    cfg = PLAN_CATALOG[payload.tier]
+    amount_inr = cfg["monthly_inr"] if payload.period == "monthly" else cfg["annual_inr"]
+    trial_ends = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+
+    if not RAZORPAY_ENABLED:
+        # Demo mode — instantly activate trial without payment, for development only
+        update = {
+            "plan_tier": payload.tier,
+            "plan_period": payload.period,
+            "subscription_status": "trial",
+            "subscription_id": f"demo_sub_{uuid.uuid4()}",
+            "trial_ends_at": trial_ends.isoformat(),
+            "current_period_end": trial_ends.isoformat(),
+            "is_premium": True,
+        }
+        await db.users.update_one({"id": user["id"]}, {"$set": update})
+        return {
+            "demo_mode": True,
+            "subscription_id": update["subscription_id"],
+            "short_url": None,
+            "message": "Demo mode active — Razorpay keys not configured. Trial granted instantly.",
+            "trial_ends_at": update["trial_ends_at"],
+        }
+
+    plan_id = await get_or_create_rzp_plan(payload.tier, payload.period)
+    if not plan_id:
+        raise HTTPException(status_code=502, detail="Could not create Razorpay plan")
+
+    start_at = int(trial_ends.timestamp())  # First charge after trial
+    total_count = 12 if payload.period == "monthly" else 5  # 12 months or 5 years
+    try:
+        sub = razorpay_client.subscription.create(
+            data={
+                "plan_id": plan_id,
+                "customer_notify": 1,
+                "quantity": 1,
+                "total_count": total_count,
+                "start_at": start_at,
+                "notes": {
+                    "user_id": user["id"],
+                    "tier": payload.tier,
+                    "period": payload.period,
+                },
+            }
+        )
+    except Exception as e:
+        logger.error(f"Razorpay subscription create failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Razorpay error: {e}")
+
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {
+            "plan_tier": payload.tier,
+            "plan_period": payload.period,
+            "subscription_id": sub["id"],
+            "subscription_status": "pending",
+            "trial_ends_at": trial_ends.isoformat(),
+        }}
+    )
+    return {
+        "subscription_id": sub["id"],
+        "short_url": sub.get("short_url"),
+        "trial_ends_at": trial_ends.isoformat(),
+        "amount_inr": amount_inr,
+        "demo_mode": False,
+    }
+
+
+class VerifyPaymentIn(BaseModel):
+    razorpay_payment_id: str
+    razorpay_subscription_id: str
+    razorpay_signature: str
+
+
+@api_router.post("/billing/verify")
+async def verify_payment(payload: VerifyPaymentIn, user: dict = Depends(get_current_user)):
+    if not RAZORPAY_ENABLED:
+        raise HTTPException(status_code=400, detail="Razorpay not configured")
+    # HMAC verification: payment_id + "|" + subscription_id, key = secret
+    body = f"{payload.razorpay_payment_id}|{payload.razorpay_subscription_id}".encode()
+    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, payload.razorpay_signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"subscription_status": "trial", "is_premium": True}}
+    )
+    return {"verified": True, "subscription_status": "trial"}
+
+
+@api_router.post("/billing/cancel")
+async def cancel_subscription(user: dict = Depends(get_current_user)):
+    sub_id = user.get("subscription_id")
+    if not sub_id:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    if RAZORPAY_ENABLED and not sub_id.startswith("demo_sub_"):
+        try:
+            razorpay_client.subscription.cancel(sub_id, {"cancel_at_cycle_end": 0})
+        except Exception as e:
+            logger.error(f"Razorpay cancel failed: {e}")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {
+            "subscription_status": "cancelled",
+            "is_premium": False,
+            "plan_tier": None,
+            "plan_period": None,
+        }}
+    )
+    return {"cancelled": True}
+
+
+@api_router.post("/billing/webhook")
+async def razorpay_webhook(request: Request):
+    """Receives subscription.* events from Razorpay and syncs DB."""
+    body = await request.body()
+    sig = request.headers.get("X-Razorpay-Signature", "")
+    if RAZORPAY_WEBHOOK_SECRET:
+        expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        evt = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    event_name = evt.get("event", "")
+    sub = evt.get("payload", {}).get("subscription", {}).get("entity", {})
+    if not sub:
+        return {"received": True}
+    sub_id = sub.get("id")
+    notes = sub.get("notes") or {}
+    user_id = notes.get("user_id")
+    if not user_id:
+        # Try to find by sub_id
+        u = await db.users.find_one({"subscription_id": sub_id})
+        if u:
+            user_id = u["id"]
+    if not user_id:
+        return {"received": True}
+
+    status_map = {
+        "subscription.activated": "active",
+        "subscription.charged": "active",
+        "subscription.completed": "completed",
+        "subscription.cancelled": "cancelled",
+        "subscription.halted": "halted",
+        "subscription.paused": "paused",
+        "subscription.resumed": "active",
+    }
+    new_status = status_map.get(event_name)
+    update = {}
+    if new_status:
+        update["subscription_status"] = new_status
+        update["is_premium"] = new_status in ("active", "trial")
+    if sub.get("current_end"):
+        update["current_period_end"] = datetime.fromtimestamp(
+            sub["current_end"], tz=timezone.utc
+        ).isoformat()
+    if update:
+        await db.users.update_one({"id": user_id}, {"$set": update})
+    return {"received": True, "event": event_name}
+
+
+# ============== App Setup ==============
+app.include_router(api_router)
+
+# Lock CORS to known origins (preview + production). Falls back to "*" only in dev.
+_extra_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+ALLOWED_ORIGINS = list({
+    "https://leadforge-ai-4.preview.emergentagent.com",
+    "https://leadforge-ai-4.emergent.host",
+    "https://leadforge.app",
+    "https://www.leadforge.app",
+    *_extra_origins,
+})
+
+# Regex catches all current + future Emergent-managed subdomains (preview & production)
+# so redeploys / new preview builds / the linked custom domain all work without a code change.
+ALLOWED_ORIGIN_REGEX = (
+    r"^https://([a-z0-9-]+\.)?(emergent\.host|preview\.emergentagent\.com|leadforge\.app)$"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
+)
+
+# Order matters: security headers should run last (i.e., wrap the response from inner middleware/routes).
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Access log runs first so it can time the full request including downstream middleware.
+app.add_middleware(AccessLogMiddleware)
+
+
+@app.on_event("startup")
+async def startup_event():
+    await db.users.create_index("email", unique=True)
+    await db.leads.create_index("reddit_id")
+    await db.user_leads.create_index([("user_id", 1), ("lead_id", 1)])
+    try:
+        await db.early_access.create_index("email", unique=True)
+    except Exception as e:
+        # Existing data may have duplicates from earlier testing — fall back to a non-unique index.
+        logger.warning("Could not create unique index on early_access.email (%s); using non-unique.", e)
+        try:
+            await db.early_access.create_index("email")
+        except Exception:
+            pass
+    logger.info("LeadForge AI API started")
+    logger.info(f"Razorpay enabled: {RAZORPAY_ENABLED}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    client.close()

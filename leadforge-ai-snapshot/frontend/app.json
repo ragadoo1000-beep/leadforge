@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "LeadForge AI",
+    "slug": "leadforge-ai",
+    "version": "1.0.0",
+    "platforms": ["web"],
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/images/favicon.png",
+      "name": "LeadForge AI — Get freelance clients from Reddit",
+      "shortName": "LeadForge AI",
+      "description": "LeadForge AI finds real client opportunities on Reddit and helps you write personalized outreach messages in seconds. No automation. You stay in control.",
+      "themeColor": "#0A0A0F",
+      "backgroundColor": "#0A0A0F",
+      "lang": "en"
+    },
+    "plugins": [
+      "expo-router"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
