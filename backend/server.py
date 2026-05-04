@@ -1773,15 +1773,23 @@ app.include_router(api_router)
 _extra_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 ALLOWED_ORIGINS = list({
     "https://leadforge-ai-4.preview.emergentagent.com",
+    "https://leadforge-ai-4.emergent.host",
     "https://leadforge.app",
     "https://www.leadforge.app",
     *_extra_origins,
 })
 
+# Regex catches all current + future Emergent-managed subdomains (preview & production)
+# so redeploys / new preview builds / the linked custom domain all work without a code change.
+ALLOWED_ORIGIN_REGEX = (
+    r"^https://([a-z0-9-]+\.)?(emergent\.host|preview\.emergentagent\.com|leadforge\.app)$"
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
     max_age=600,
