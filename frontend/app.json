@@ -3,11 +3,7 @@
     "name": "LeadForge AI",
     "slug": "leadforge-ai",
     "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/images/icon.png",
-    "scheme": "leadforge",
-    "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
+    "platforms": ["web"],
     "web": {
       "bundler": "metro",
       "output": "static",
@@ -20,17 +16,7 @@
       "lang": "en"
     },
     "plugins": [
-      "expo-router",
-      [
-        "expo-splash-screen",
-        {
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#0A0A0F"
-        }
-      ],
-      "expo-web-browser"
+      "expo-router"
     ],
     "experiments": {
       "typedRoutes": true

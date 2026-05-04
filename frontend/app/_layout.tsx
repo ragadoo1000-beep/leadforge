@@ -1,8 +1,6 @@
-import React, { useEffect } from "react";
+import React from "react";
 import { Stack } from "expo-router";
-import { StatusBar } from "expo-status-bar";
 import { View, ActivityIndicator } from "react-native";
-import * as SplashScreen from "expo-splash-screen";
 import {
   useFonts,
   Sora_400Regular,
@@ -18,23 +16,6 @@ import {
   GeistMono_500Medium,
   GeistMono_700Bold,
 } from "@expo-google-fonts/geist-mono";
-import { AuthProvider } from "../src/contexts/AuthContext";
-import { ThemeProvider, useTheme } from "../src/contexts/ThemeContext";
-
-SplashScreen.preventAutoHideAsync().catch(() => {});
-
-function ThemedStack() {
-  const { colors } = useTheme();
-  return (
-    <Stack
-      screenOptions={{
-        headerShown: false,
-        contentStyle: { backgroundColor: colors.background },
-        animation: "slide_from_right",
-      }}
-    />
-  );
-}
 
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({
@@ -47,12 +28,6 @@ export default function RootLayout() {
     GeistMono_500Medium,
     GeistMono_700Bold,
   });
-
-  useEffect(() => {
-    if (fontsLoaded) {
-      SplashScreen.hideAsync().catch(() => {});
-    }
-  }, [fontsLoaded]);
 
   if (!fontsLoaded) {
     return (
@@ -70,11 +45,11 @@ export default function RootLayout() {
   }
 
   return (
-    <ThemeProvider>
-      <AuthProvider>
-        <StatusBar style="auto" />
-        <ThemedStack />
-      </AuthProvider>
-    </ThemeProvider>
+    <Stack
+      screenOptions={{
+        headerShown: false,
+        contentStyle: { backgroundColor: "#0A0A0F" },
+      }}
+    />
   );
 }
